@@ -15,4 +15,8 @@ Each entry:
 
 ---
 
-<!-- Entries added below as commits land -->
+## Commit 01 — project-foundation
+
+**Concept:** `depends_on` with `condition: service_healthy` vs plain `depends_on`
+
+**Why it matters here:** Plain `depends_on` only waits for the container to *start* — it doesn't wait for the service inside to be *ready*. Postgres starts its container in ~1 second but may take 5–10 seconds to accept connections. Without `condition: service_healthy`, the FastAPI container starts, tries to connect, fails, and crashes — requiring a manual restart or luck with timing. With `condition: service_healthy`, Docker Compose waits until `pg_isready` returns success before starting the `api` container. Every service in this stack uses health checks for this reason.

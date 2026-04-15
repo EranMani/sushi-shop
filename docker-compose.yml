@@ -1,0 +1,111 @@
+version: "3.9"
+
+# docker-compose.yml — Full Sushi Shop stack
+#
+# Five services, startup order enforced via depends_on + condition: service_healthy.
+# No service starts before its dependencies are healthy — a silent crash during startup
+# is harder to debug than a clear "waiting for db" message.
+#
+# Services:
+#   db      — PostgreSQL 16, persistent named volume, pg_isready health check
+#   redis   — Redis 7 Alpine, persistent named volume, redis-cli ping health check
+#   api     — FastAPI app, built from Dockerfile, runs migrations then uvicorn
+#   worker  — Celery worker, same image as api, CMD overridden
+#   nginx   — Nginx Alpine, proxies port 80 → api:8000, depends on api being healthy
+#
+# Scaling: docker-compose up --scale api=3 distributes load across replicas.
+# Nginx round-robins across all healthy api instances.
+
+services:
+
+  # ─── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sushi
+      POSTGRES_PASSWORD: sushi
+      POSTGRES_DB: sushi
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sushi -d sushi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ─── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # ─── FastAPI application ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # wget is available in python:3.12-slim; curl is not installed by default
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    # No port exposed here — all external traffic goes through Nginx on port 80
+    expose:
+      - "8000"
+
+  # ─── Celery kitchen worker ────────────────────────────────────────────────────
+  # Same image as the api service — differentiated only by CMD.
+  # Runs alembic upgrade head first so it has a consistent schema view,
+  # then starts the Celery worker process.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sh", "-c", "alembic upgrade head && celery -A src.core.celery_app worker --loglevel=info"]
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── Nginx load balancer ──────────────────────────────────────────────────────
+  # Routes all external traffic to the FastAPI replicas.
+  # Rate limiting (Commit 15) is not configured yet — this is a functional proxy only.
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+# ─── Named volumes ────────────────────────────────────────────────────────────
+# Named volumes persist across docker-compose down/up cycles.
+# Use docker-compose down -v to explicitly remove volumes and start fresh.
+volumes:
+  postgres_data:
+  redis_data:

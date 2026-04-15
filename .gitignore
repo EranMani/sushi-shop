@@ -1,0 +1,55 @@
+# .gitignore — Standard Python + Docker project gitignore
+
+# Environment files — secrets must never be committed
+.env
+.env.local
+.env.*.local
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# Python packaging and distribution
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+
+# Logs
+*.log
+/logs/
+
+# IDE and editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker volumes (if ever bind-mounted to local paths)
+data/
+
+# Alembic — generated but not committed (only versions/ is committed)
+# alembic/versions is committed intentionally

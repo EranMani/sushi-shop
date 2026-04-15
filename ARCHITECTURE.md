@@ -26,6 +26,28 @@ Customer
 
 ---
 
+## Infrastructure Layer
+
+Five Docker Compose services make up the full local stack. Startup order is enforced via
+`depends_on` with `condition: service_healthy` — no service starts before its dependencies
+pass their health check.
+
+| Service | Image | Health check | Role |
+|---|---|---|---|
+| `db` | `postgres:16` | `pg_isready -U sushi -d sushi` | Persistent data store |
+| `redis` | `redis:7-alpine` | `redis-cli ping` | Celery broker + menu/order cache |
+| `api` | Built from `Dockerfile` | `wget /health` → FastAPI | REST API + LangGraph agent |
+| `worker` | Same image as `api` | None (worker, not a server) | Celery task processor |
+| `nginx` | `nginx:alpine` | Depends on `api` healthy | Load balancer, proxies port 80 → api:8000 |
+
+**Key implementation details:**
+- `api` and `worker` share the same Docker image. They are differentiated by `command` override in `docker-compose.yml`.
+- Alembic runs automatically on container start (`alembic upgrade head && uvicorn ...`) — schema is always current when the application starts, no manual migration step required.
+- Named volumes (`postgres_data`, `redis_data`) persist data across `docker-compose down/up`. Use `docker-compose down -v` to wipe and start fresh.
+- Nginx config in Commit 01 is a minimal passthrough proxy. Rate limiting and full upstream config is added in Commit 15.
+
+---
+
 ## Decisions
 
 ---
