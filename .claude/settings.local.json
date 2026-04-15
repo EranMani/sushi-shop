@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp .claude/agents/axel.md .claude/agents/adam.md)",
+      "Bash(cp .claude/agents/logs/axel-worklog.md .claude/agents/logs/adam-worklog.md)",
+      "Bash(rm .claude/agents/axel.md .claude/agents/logs/axel-worklog.md)"
+    ]
+  }
+}
