@@ -103,6 +103,40 @@ Each entry:
 
 ---
 
+## Commit 03 — alembic-initial-migration
+
+---
+
+### D-09 · Alembic async bridge pattern in `env.py`
+
+**What:** `env.py` uses `asyncio.run(run_async_migrations())` → `AsyncEngine` → `connection.run_sync()` to bridge Alembic's synchronous migration runner into the async SQLAlchemy engine.
+
+**Why:** Alembic's `context.run_migrations()` is synchronous — it cannot be called directly from an async context. The bridge pattern (`run_sync`) passes a sync-compatible connection into the migration runner while keeping the engine async. This is the officially documented SQLAlchemy 2.x + Alembic pattern. The deprecated `strategy="threadlocal"` approach was explicitly avoided.
+
+**Raised by:** Rex (Commit 03)
+
+---
+
+### D-10 · `orderstatus` enum explicit `create()` / `drop()` in migration
+
+**What:** The `orderstatus` Postgres enum is created with `orderstatus_enum.create(op.get_bind(), checkfirst=True)` before the `orders` table, and dropped explicitly in `downgrade()` after `orders` is dropped.
+
+**Why:** Alembic does not reliably manage standalone Postgres enum type lifecycle implicitly. If the enum is created as a side-effect of `op.create_table()`, Alembic may fail to drop it on downgrade — leaving an orphaned type that blocks future migrations. Explicit `create()` and `drop()` with `checkfirst=True` gives full control and ensures a clean upgrade and downgrade path.
+
+**Raised by:** Rex (Commit 03)
+
+---
+
+### D-11 · `alembic.ini` has no database URL
+
+**What:** `sqlalchemy.url` is absent from `alembic.ini`. `env.py` reads `DATABASE_URL` from the environment at runtime and raises a clear `RuntimeError` if it is missing.
+
+**Why:** `alembic.ini` is committed to version control. Database credentials must never appear in a committed file. Reading from the environment at runtime keeps credentials out of the repo entirely while still providing a helpful error message when the variable is missing.
+
+**Raised by:** Rex (Commit 03)
+
+---
+
 ### D-07 · `database.py` reads `os.environ` directly in Commit 02
 
 **What:** `DATABASE_URL` is read via `os.environ["DATABASE_URL"]` rather than through `settings.py`.

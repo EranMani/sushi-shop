@@ -267,6 +267,28 @@ The join table is the correct relational pattern.
 
 ---
 
+## Migration Layer
+
+All schema changes go through Alembic. No manual DDL. No `Base.metadata.create_all()` in production.
+
+**`alembic.ini`** — Alembic CLI configuration. `script_location = alembic`. No database URL in this file — credentials are read from `DATABASE_URL` env var at runtime.
+
+**`alembic/env.py`** — Async bridge between Alembic's synchronous migration runner and the asyncpg engine:
+```
+alembic upgrade head
+  → run_migrations_online()
+    → asyncio.run(run_async_migrations())
+      → AsyncEngine.connect()
+        → connection.run_sync(_run_migrations_with_connection)
+          → context.run_migrations()  ← synchronous Alembic runner
+```
+
+**`alembic/versions/`** — Versioned migration files. Each file has `upgrade()` and `downgrade()`. Files are named descriptively: `0001_initial_schema.py`.
+
+**Migration discovery:** `env.py` imports `Base` from `src.models`, which triggers `src/models/__init__.py` and registers all five models on `Base.metadata`. Alembic reads `target_metadata = Base.metadata` to know what tables exist.
+
+---
+
 ## Testing Strategy
 
 | Layer | Tool | What is tested |

@@ -31,6 +31,14 @@ Each entry:
 
 ---
 
+## Commit 03 — alembic-initial-migration
+
+**Concept:** Alembic async bridge — why migrations need a sync/async bridge
+
+**Why it matters here:** Alembic's migration runner (`context.run_migrations()`) is synchronous — it was built before async Python existed. But this project uses an async SQLAlchemy engine with asyncpg. To connect them, `env.py` uses a bridge pattern: `asyncio.run()` starts an async context, creates an `AsyncEngine`, opens a connection, then calls `connection.run_sync()` to hand a sync-compatible connection back to Alembic's runner. The key insight: `run_sync()` lets you call synchronous code from within an async context by running it in a thread. This pattern appears anywhere you need to bridge old synchronous libraries into a modern async codebase.
+
+---
+
 ## Commit 02 — database-models
 
 **Concept:** `expire_on_commit=False` in async SQLAlchemy

@@ -5,6 +5,7 @@
 | # | Commit | Status | Key Decision |
 |---|--------|--------|--------------|
 | 01 | `database-models` | ✅ Done | `ARRAY(String)` for tags, named `orderstatus` enum, `expire_on_commit=False`, `os.environ` for DATABASE_URL (settings.py deferred to Commit 05) |
+| 02 | `alembic-initial-migration` | ✅ Done | Hand-written migration (no autogenerate); `orderstatus` enum created as standalone Postgres type with `create_type=False` + explicit `.create()` / `.drop()` to survive table drops |
 
 ---
 
@@ -78,6 +79,89 @@ The commit protocol puts `settings.py` in Commit 05 (`core-dependencies`) but `d
 - New component: `src/models/` — SQLAlchemy ORM layer (Meal, Ingredient, MealIngredient, Order, OrderItem)
 - New component: `src/core/database.py` — async engine, `AsyncSession` factory, `get_db` FastAPI dependency
 - Data model relationships documented: Meal ↔ Ingredient (many-to-many via MealIngredient), Order ↔ Meal (many-to-many via OrderItem)
+
+---
+
+---
+
+## Session 02 — Commit 03: `alembic-initial-migration`
+
+**Date:** 2026-04-16
+**Task:** Configure Alembic for async SQLAlchemy and write the initial schema migration by hand.
+
+### Task Brief
+
+No live database available, so this is a hand-written migration that replicates the ORM models exactly. The goal is a reviewable DDL record that Alembic can run against a fresh Postgres instance and produce the exact schema the models expect.
+
+Files to produce:
+- `alembic.ini` — Alembic CLI configuration (DB URL intentionally omitted, read from env)
+- `alembic/env.py` — async bridge pattern (`run_async_migrations` + `run_sync`)
+- `alembic/versions/0001_initial_schema.py` — all five tables + orderstatus enum
+- `alembic/script.py.mako` — template for future `alembic revision` calls
+
+### Decisions Made
+
+**1. `alembic.ini` does not contain the database URL.**
+The URL would be a credential. `env.py` reads `DATABASE_URL` from the environment at runtime and raises a clear `RuntimeError` if it is not set. This is safer than a placeholder that might accidentally be committed or used.
+
+**2. Async bridge uses `connection.run_sync(_run_migrations_with_connection)` pattern.**
+Alembic's `context.run_migrations()` is synchronous. The correct bridge is: create `AsyncEngine`, connect via `async with connectable.connect()`, then call `await connection.run_sync(...)` which executes a sync callable with a sync-compatible connection. This is the pattern documented in the official Alembic async cookbook.
+
+**3. `orderstatus` Postgres enum handled with `create_type=False` + explicit `.create()` / `.drop()`.**
+The problem with letting Alembic manage a named enum implicitly: it may or may not drop the type when the table referencing it is dropped, depending on version and context. The explicit pattern gives full control:
+- `upgrade()`: creates the enum standalone before creating `orders`, so even if table creation fails the enum can be cleaned up independently.
+- `downgrade()`: drops the enum after dropping `orders`, with `checkfirst=True` so it does not error if already absent.
+This matches the ORM definition (`create_type=True` on the `Enum(...)` column — Alembic handles the creation coordination at the column level during ORM-driven DDL, but in migration files the explicit pattern is safer and more transparent).
+
+**4. Imports go before module-level revision variables.**
+PEP 8 requires module-level imports at the top. The `from __future__ import annotations` enables the `str | None` union syntax used in the revision identifiers on Python 3.12 (already the minimum version, so this is belt-and-suspenders).
+
+**5. `downgrade()` drop order is reverse of `upgrade()` create order.**
+Dropping order: `order_items` → `orders` → `meal_ingredients` → `meals` → `ingredients`. This is the only order that satisfies FK constraints without needing `CASCADE` on the drops themselves.
+
+**6. No `alembic/versions/__init__.py` needed.**
+Alembic loads migration files as standalone scripts, not as a Python package. Adding `__init__.py` would confuse Alembic's script loader. Left intentionally absent.
+
+### Issues Found Mid-Task
+
+**No existing `alembic.ini` or `alembic/env.py`.**
+The commit protocol assumed these files existed (from a standard `alembic init`). They did not — the project had the `alembic/` directory in the spec but nothing on disk. Created them from scratch. This is not a problem; it is actually better — a clean `alembic init` output has comments and patterns that assume sync SQLAlchemy. Writing from scratch means the async pattern is correct from the start and there is no dead code to clean up.
+
+**`script.py.mako` was also missing.**
+Without this template, `alembic revision` fails. Added the standard Alembic mako template so future migration generation works correctly.
+
+### Self-Review Checklist
+
+- [x] `alembic.ini` — no credentials, correct `script_location`, correct `file_template`
+- [x] `env.py` — `target_metadata = Base.metadata` set correctly
+- [x] `env.py` — all models imported via `from src.models import Base` (which imports all model files)
+- [x] `env.py` — async bridge uses `run_sync` pattern, not a bare `asyncio.run(context.run_migrations())`
+- [x] `env.py` — `get_database_url()` raises clear `RuntimeError` if env var missing
+- [x] `0001_initial_schema.py` — all five tables created
+- [x] `meals.tags` — `postgresql.ARRAY(sa.String())` with `server_default="{}"`
+- [x] `meals.is_available` — `Boolean`, `server_default=sa.text("true")`
+- [x] `ingredients.stock_quantity` — `Numeric(10, 2)`, `server_default=sa.text("0")`
+- [x] `meal_ingredients` — composite PK `(meal_id, ingredient_id)`, both FKs `ondelete="CASCADE"`
+- [x] `orders.status` — `orderstatus` enum, `server_default="PENDING"`, `create_type=False`
+- [x] `orders.created_at` / `updated_at` — `DateTime(timezone=True)`, `server_default=sa.text("now()")`
+- [x] `order_items` — composite PK `(order_id, meal_id)`, `order_id` FK `CASCADE`, `meal_id` FK `RESTRICT`
+- [x] `downgrade()` drops tables in correct reverse order
+- [x] `downgrade()` explicitly drops the `orderstatus` enum after `orders` is dropped
+- [x] `orderstatus_enum` created with `checkfirst=True` (safe to run twice), dropped with `checkfirst=True`
+- [x] No `Any` in type hints (except the intentional `# type: ignore` on `_run_migrations_with_connection` parameter — documented inline)
+- [x] No raw SQL — all DDL through `op.create_table()`, `op.drop_table()`, Alembic column/constraint objects
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `Alembic async bridge pattern` — `env.py` uses `AsyncEngine` + `connection.run_sync()` (not deprecated `strategy="threadlocal"` or bare `asyncio.run()`); this is the officially documented pattern for SQLAlchemy 2.x async migrations
+- `orderstatus enum explicit create/drop in migration` — using `create_type=False` + `.create()` / `.drop()` rather than letting Alembic infer enum lifecycle; prevents silent failures on partial upgrades and ensures clean downgrade path
+- `alembic.ini has no database URL` — URL is read from `DATABASE_URL` env var at runtime; config file never contains credentials
+
+**ARCHITECTURE.md:**
+- New component: `alembic/` — migration layer; all schema changes tracked here; `env.py` is the async bridge between Alembic runner and the asyncpg engine
+- New component: `alembic.ini` — CLI configuration (points to `alembic/` as `script_location`)
+- Data flow addition: `alembic upgrade head` → `env.py` → `AsyncEngine (asyncpg)` → Postgres DDL
 
 ---
 
