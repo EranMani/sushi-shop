@@ -54,12 +54,15 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     Usage in a route:
         async def my_route(db: AsyncSession = Depends(get_db)) -> ...:
 
-    The session is closed in the finally block regardless of whether the
-    route handler raises an exception. Rollback on error is the caller's
-    responsibility (or handled by the service layer).
+    On exception: rolls back explicitly before re-raising. SQLAlchemy rolls
+    back implicitly on session.close(), but explicit rollback makes the intent
+    clear and avoids relying on implicit behaviour for correctness.
     """
     async with async_session_factory() as session:
         try:
             yield session
+        except Exception:
+            await session.rollback()
+            raise
         finally:
             await session.close()

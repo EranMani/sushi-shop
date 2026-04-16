@@ -93,6 +93,16 @@ Each entry:
 
 ---
 
+### D-08 · Explicit rollback in `get_db` on exception
+
+**What:** Added `except Exception: await session.rollback(); raise` to `get_db` before the `finally` block.
+
+**Why:** SQLAlchemy rolls back an uncommitted transaction implicitly when a session closes. Relying on that implicit behaviour is correct but non-obvious — a developer reading `get_db` has no signal that rollback is handled. The explicit pattern makes the intent clear, handles edge cases where partial session state might not clean up correctly on close, and is the safer production choice. The `raise` re-raises the original exception so FastAPI can return the correct error response.
+
+**Raised by:** Eran (identified during Commit 02 review, raised via Rex)
+
+---
+
 ### D-07 · `database.py` reads `os.environ` directly in Commit 02
 
 **What:** `DATABASE_URL` is read via `os.environ["DATABASE_URL"]` rather than through `settings.py`.
