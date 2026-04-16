@@ -183,6 +183,12 @@ black box — unacceptable.
 runtime during a demo is worse than one that refuses to start. Env var validation happens
 at boot — not at the first request that needs the missing variable.
 
+**Design for production, not just dev.** Every infrastructure decision must be evaluated
+against production behaviour — not just "does it work locally". Before finalising any
+Dockerfile, compose config, or Nginx rule, ask: what happens when this runs under real
+load? What happens on `docker stop`? What happens when a worker crashes mid-request?
+A config that works in dev but fails gracefully in production is not finished.
+
 **Alembic runs on container start.** The FastAPI container's entrypoint runs
 `alembic upgrade head` before starting uvicorn. This ensures the schema is always
 current when the application starts, without requiring a manual migration step.

@@ -15,6 +15,14 @@ Each entry:
 
 ---
 
+## entrypoint.sh / PID 1 fix (post Commit 01)
+
+**Concept:** PID 1 and graceful shutdown in Docker containers
+
+**Why it matters here:** Docker sends `SIGTERM` to PID 1 when a container stops. With `CMD ["sh", "-c", "..."]`, `sh` is PID 1 — it may not forward the signal to uvicorn, causing requests to be dropped on deploy or scale-down. Using an `entrypoint.sh` script with `exec uvicorn ...` replaces the shell process with uvicorn, making uvicorn PID 1. It receives `SIGTERM` directly, drains in-flight requests, and exits cleanly. The `exec` keyword is what makes this work — without it, the shell stays as PID 1 even with a script.
+
+---
+
 ## uv / pip swap (post Commit 01)
 
 **Concept:** Multi-stage Docker builds for injecting external binaries

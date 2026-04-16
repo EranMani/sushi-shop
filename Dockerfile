@@ -58,9 +58,15 @@ COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 
+# Copy entrypoint script and make it executable
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
 # Expose the port uvicorn will listen on
 EXPOSE 8000
 
-# Default command: run Alembic migrations then start the API server.
-# The Celery worker service overrides this CMD in docker-compose.yml.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"]
+# ENTRYPOINT runs entrypoint.sh, which runs migrations then execs uvicorn.
+# exec inside the script replaces sh with uvicorn — uvicorn becomes PID 1
+# and receives SIGTERM directly on `docker stop`, enabling graceful shutdown.
+# The Celery worker service overrides this entirely via `command:` in docker-compose.yml.
+ENTRYPOINT ["./entrypoint.sh"]

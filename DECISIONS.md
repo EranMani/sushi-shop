@@ -49,6 +49,16 @@ Each entry:
 
 ---
 
+### D-02c · entrypoint.sh with `exec` so uvicorn is PID 1
+
+**What:** Replaced `CMD ["sh", "-c", "alembic upgrade head && uvicorn ..."]` with a dedicated `entrypoint.sh` script that runs migrations then calls `exec uvicorn ...`. The `ENTRYPOINT` instruction runs the script.
+
+**Why:** With `sh -c`, `sh` is PID 1 inside the container. Docker sends `SIGTERM` to PID 1 on `docker stop` — if that's `sh`, the signal may not be forwarded to uvicorn. The result is uvicorn getting hard-killed after the 10s timeout, dropping any in-flight requests. `exec` replaces the shell process with uvicorn, making uvicorn PID 1 directly. It receives `SIGTERM`, finishes in-flight requests, and exits cleanly. Acceptable in dev; required in production.
+
+**Raised by:** Eran (identified during Commit 01 review)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.
