@@ -15,6 +15,14 @@ Each entry:
 
 ---
 
+## uv / pip swap (post Commit 01)
+
+**Concept:** Multi-stage Docker builds for injecting external binaries
+
+**Why it matters here:** `uv` isn't in the Python base image, so to add it without using `pip` or `curl`, Adam used a multi-stage build: `FROM ghcr.io/astral-sh/uv:0.6.14 AS uv-binary`, then `COPY --from=uv-binary /uv /usr/local/bin/uv` in the main stage. The first stage is discarded — only the binary lands in the final image. This pattern is useful any time you need a tool inside a container but don't want to install it via a package manager. The tag is pinned (`0.6.14`, not `:latest`) so a version bump is an explicit, reviewable change.
+
+---
+
 ## Commit 01 — project-foundation
 
 **Concept:** `depends_on` with `condition: service_healthy` vs plain `depends_on`
