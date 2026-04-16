@@ -59,6 +59,50 @@ Each entry:
 
 ---
 
+## Commit 02 — database-models
+
+---
+
+### D-04 · `Meal.tags` as `ARRAY(String)` (Postgres native array)
+
+**What:** Tags are stored as a Postgres native `ARRAY(String)` column rather than a separate `Tag` table or a JSON column.
+
+**Why:** Tags have no relational identity — no tag-specific attributes, no many-to-many relationships beyond the meal itself. A separate table adds a join with no benefit. JSON would work but loses Postgres index support. `ARRAY(String)` is queryable, FTS-friendly, and the simplest correct choice for this use case.
+
+**Raised by:** Rex (Commit 02)
+
+---
+
+### D-05 · `OrderStatus` enum named `"orderstatus"` explicitly
+
+**What:** The SQLAlchemy `Enum` column is declared with `name="orderstatus"` explicitly rather than letting SQLAlchemy generate a name.
+
+**Why:** Postgres creates a named enum type when a `SQLAlchemy.Enum` column is defined. Without an explicit name, Alembic autogenerate can produce collisions or inconsistent names across migration runs. Explicit naming makes the Postgres type name deterministic and predictable in migrations.
+
+**Raised by:** Rex (Commit 02)
+
+---
+
+### D-06 · `expire_on_commit=False` on `AsyncSession`
+
+**What:** The session factory is configured with `expire_on_commit=False`.
+
+**Why:** In synchronous SQLAlchemy, `expire_on_commit=True` (the default) marks all ORM attributes as expired after a commit, triggering a lazy reload on next access. In async context, that lazy reload requires an implicit I/O operation which raises an error — async SQLAlchemy does not support implicit lazy loading. `expire_on_commit=False` keeps attributes accessible post-commit. Services that need guaranteed fresh data after a commit call `session.refresh(obj)` explicitly.
+
+**Raised by:** Rex (Commit 02)
+
+---
+
+### D-07 · `database.py` reads `os.environ` directly in Commit 02
+
+**What:** `DATABASE_URL` is read via `os.environ["DATABASE_URL"]` rather than through `settings.py`.
+
+**Why:** `settings.py` (Pydantic Settings) is Commit 05's work. Importing it here would create a dependency on code that doesn't exist yet. The `os.environ` call is a deliberate temporary bridge — documented inline with a TODO. Commit 05 will replace it with `get_settings()`.
+
+**Raised by:** Rex (Commit 02)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.

@@ -229,25 +229,41 @@ we fail fast with a clear customer message rather than hanging or cascading.
 
 ```
 Meal
-  id, name, description, price, tags (for FTS), is_available
+  id, name, description, price, tags (ARRAY(String)), is_available
 
 Ingredient
-  id, name, unit, stock_quantity
+  id, name, unit, stock_quantity (Numeric 10,2)
 
-MealIngredient  (join table)
-  meal_id, ingredient_id, quantity_required
+MealIngredient  (explicit association class)
+  meal_id → Meal, ingredient_id → Ingredient, quantity_required (Numeric 10,2)
 
 Order
-  id, customer_id, status (PENDING|PREPARING|READY), created_at, updated_at
+  id, customer_name (String 200), status (OrderStatus enum), created_at, updated_at
 
-OrderItem  (join table)
-  order_id, meal_id, quantity
+OrderItem  (explicit association class)
+  order_id → Order, meal_id → Meal, quantity (Integer)
 ```
+
+**OrderStatus state machine:**
+```
+PENDING → PREPARING → READY
+PENDING | PREPARING → FAILED  (DLQ handler)
+```
+State transitions are enforced in `order_service.py` — not at the ORM level.
+Any invalid transition raises `ValueError`.
+
+**Why `MealIngredient` and `OrderItem` are mapped classes, not bare `Table()`:**
+Both carry payload columns (`quantity_required`, `quantity`) that service code reads directly.
+A plain association table with no mapped class would require raw SQL or awkward joins to access those columns.
 
 **Why `OrderItem` as a separate table:**
 A single order can contain multiple meals in varying quantities.
 A direct foreign key from Order to Meal would enforce one meal per order.
 The join table is the correct relational pattern.
+
+**Models live in:** `src/models/` — `base.py`, `meal.py`, `ingredient.py`, `meal_ingredient.py`, `order.py`, `order_item.py`
+
+**Async session factory:** `src/core/database.py` — `async_engine`, `async_session_factory`, `get_db` FastAPI dependency.
 
 ---
 
