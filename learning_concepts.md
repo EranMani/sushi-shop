@@ -31,6 +31,14 @@ Each entry:
 
 ---
 
+## Commit 02 — database-models
+
+**Concept:** `expire_on_commit=False` in async SQLAlchemy
+
+**Why it matters here:** In sync SQLAlchemy, after a `session.commit()`, all ORM object attributes are marked "expired" and reloaded on next access via a lazy SQL query. In async context, that implicit lazy load raises an error — async SQLAlchemy has no event loop to trigger it on. `expire_on_commit=False` disables the expiry, keeping attributes readable after commit. The tradeoff: if you need guaranteed fresh data after a commit, you must call `session.refresh(obj)` explicitly. This pattern appears throughout Rex's service functions whenever a newly created object is returned to the caller.
+
+---
+
 ## Commit 01 — project-foundation
 
 **Concept:** `depends_on` with `condition: service_healthy` vs plain `depends_on`
