@@ -147,6 +147,40 @@ Each entry:
 
 ---
 
+## Commit 05 — core-dependencies
+
+---
+
+### D-15 · `get_settings()` cached with `lru_cache(maxsize=1)`
+
+**What:** The `Settings` instance is wrapped in `@lru_cache(maxsize=1)` so it is constructed once per process lifetime and reused on every subsequent call.
+
+**Why:** Env vars don't change at runtime — reading and validating them on every request would be wasteful and misleading. Caching makes the singleton nature explicit. **Test caveat:** tests that patch env vars must call `get_settings.cache_clear()` before patching to force re-instantiation; otherwise the cached instance with the old values is returned.
+
+**Raised by:** Rex (Commit 05)
+
+---
+
+### D-16 · `DATABASE_URL` asyncpg scheme validator in `Settings`
+
+**What:** A `@field_validator` on `database_url` rejects any URL that does not start with `postgresql+asyncpg://`.
+
+**Why:** A plain `postgresql://` URL reaches SQLAlchemy's engine creation and fails with a dialect error that gives no pointer to the misconfigured env var. The validator catches it at startup with the exact value and the fix. This is a common misconfiguration on first setup.
+
+**Raised by:** Rex (Commit 05)
+
+---
+
+### D-17 · `deps.py` as stable import home for shared FastAPI dependencies
+
+**What:** `src/core/deps.py` re-exports `get_db` from `src.core.database`. Routes import from `deps`, not from `database` directly.
+
+**Why:** As the route layer grows, routes importing from each other or from deep core modules creates circular import risk. A thin re-export file gives every route a consistent, circular-import-safe import path. Future shared dependencies (auth, rate-limit bypass, pagination params) slot in here without touching individual route files.
+
+**Raised by:** Rex (Commit 05)
+
+---
+
 ## Commit 04 — pydantic-schemas
 
 ---

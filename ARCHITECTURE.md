@@ -267,6 +267,28 @@ The join table is the correct relational pattern.
 
 ---
 
+## Configuration Layer
+
+All application configuration flows through `src/core/settings.py`. No component reads `os.environ` directly.
+
+**`src/core/settings.py`** — Pydantic `BaseSettings` singleton. Reads from `.env` file and environment variables. Validated at startup — missing required vars or a wrong `DATABASE_URL` scheme fail immediately with a descriptive error, not silently at first use. Cached via `@lru_cache(maxsize=1)` so Settings is instantiated once per process lifetime.
+
+**`src/core/deps.py`** — Stable re-export of all shared FastAPI `Depends(...)` callables. Routes import from here, not from `database.py` directly. Prevents circular imports as the route layer grows. Future shared dependencies (auth, pagination params) live here.
+
+**Startup validation chain:**
+```
+process start
+  → get_settings() instantiated (lru_cache miss)
+    → .env file read + env vars merged
+    → field validators run (database_url scheme, cache_ttl > 0)
+    → model_validator runs (LLM provider API key present)
+    → Settings instance cached
+  → async_engine created using settings.database_url
+  → FastAPI app mounts routes
+```
+
+---
+
 ## Schema Layer
 
 All API-facing data contracts live in `src/schemas/`. No business logic — shapes only.

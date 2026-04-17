@@ -5,12 +5,7 @@
 # All database access in this project goes through AsyncSession. Lazy loading
 # is not available in async context — every relationship must be loaded
 # explicitly using selectinload() or joinedload() in the query.
-#
-# NOTE: This file reads DATABASE_URL and APP_ENV directly from environment
-# variables. In Commit 05, `settings.py` (Pydantic Settings) will be wired
-# in and this direct os.getenv call will be replaced with get_settings().
 
-import os
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
@@ -19,19 +14,20 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-_database_url: str = os.environ["DATABASE_URL"]
-_app_env: str = os.getenv("APP_ENV", "development")
+from src.core.settings import get_settings
+
+_settings = get_settings()
 
 # ─── Engine ───────────────────────────────────────────────────────────────────
 
 async_engine = create_async_engine(
-    _database_url,
+    _settings.database_url,
     # Pool sizing: two replicas behind Nginx, default pool_size=5 each is fine
     # for development. Tune via env in production.
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,  # cheap liveness check before handing a connection to a caller
-    echo=_app_env == "development",  # SQL logging in dev only
+    echo=_settings.app_env == "development",  # SQL logging in dev only
 )
 
 # ─── Session factory ──────────────────────────────────────────────────────────

@@ -31,6 +31,14 @@ Each entry:
 
 ---
 
+## Commit 05 — core-dependencies
+
+**Concept:** `@lru_cache` as a process-lifetime singleton for configuration
+
+**Why it matters here:** `get_settings()` is wrapped with `@lru_cache(maxsize=1)` — the first call constructs the `Settings` instance (reading env vars, running validators), and every subsequent call returns the cached instance. This makes configuration a singleton without a global variable. The non-obvious part: in tests, if you patch env vars after the first call, you get the stale cached Settings. The fix is `get_settings.cache_clear()` before patching, which evicts the cache and forces re-instantiation. This pattern — `lru_cache` on a factory function — is the idiomatic way to build lazy singletons in Python without a class-level `_instance` variable.
+
+---
+
 ## Commit 03 — alembic-initial-migration
 
 **Concept:** Alembic async bridge — why migrations need a sync/async bridge

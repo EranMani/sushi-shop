@@ -7,6 +7,7 @@
 | 01 | `database-models` | ✅ Done | `ARRAY(String)` for tags, named `orderstatus` enum, `expire_on_commit=False`, `os.environ` for DATABASE_URL (settings.py deferred to Commit 05) |
 | 02 | `alembic-initial-migration` | ✅ Done | Hand-written migration (no autogenerate); `orderstatus` enum created as standalone Postgres type with `create_type=False` + explicit `.create()` / `.drop()` to survive table drops |
 | 03 | `pydantic-schemas` | ✅ Done | `OrderStatus` imported from ORM model (single source of truth, no drift risk); `OrderItemRead` carries optional `meal_name` + `price_each` for agent readability; `IngredientStockUpdate` is absolute replacement (not delta) — documented in field description |
+| 04 | `core-dependencies` | ✅ Done | `get_settings()` cached with `lru_cache(maxsize=1)`; `database_url_must_use_asyncpg` validator catches wrong driver at startup not at engine creation; `deps.py` is a thin re-export to break circular imports in routes |
 
 ---
 
@@ -269,3 +270,85 @@ The project runs inside Docker, so local imports fail without installing the pac
 - `order.items` → list of `OrderItem` objects (each has `.meal` and `.quantity`)
 
 **I'm not done yet (Nova doesn't start from models alone).** Nova starts after Commit 05 (services). This note is for Claude's awareness of what the model layer provides.
+
+---
+
+---
+
+## Session 04 — Commit 05: `core-dependencies`
+
+**Date:** 2026-04-17
+**Task:** Build `src/core/settings.py` (Pydantic Settings), update `src/core/database.py` to use it, and create `src/core/deps.py`.
+
+### Task Brief
+
+Three files, clear scope:
+1. `settings.py` — Pydantic `BaseSettings` that reads all env vars, validates them at startup, and is cached as a singleton via `lru_cache`.
+2. `database.py` — resolve the `os.environ` TODO from Session 01. Replace the direct env reads with `get_settings()`.
+3. `deps.py` — thin re-export module so routes import `get_db` from one stable location.
+
+Constraints going in:
+- Pydantic v2 `BaseSettings` with `SettingsConfigDict`
+- `get_settings()` must be cached — only one `Settings` instantiation per process
+- Missing required vars must fail at startup with a message that names the missing var and says what to do
+- No `Any` in type hints
+
+### Decisions Made
+
+**1. `database.py` calls `get_settings()` at module load time (not inside `get_db`).**
+The engine is a module-level singleton — it is created once when the module is first imported, not per-request. So `get_settings()` must be called at module scope too. This is consistent with how the engine is built: once, with fixed configuration. If the URL changes, you restart the process.
+
+**2. `Settings` has a `database_url_must_use_asyncpg` validator.**
+A wrong driver scheme (`postgresql://` instead of `postgresql+asyncpg://`) fails at engine creation with a cryptic SQLAlchemy error about a missing dialect. Catching it in the validator produces a message that identifies the exact value and what to change. This is the kind of error a developer hits once and cannot easily diagnose without knowing where to look.
+
+**3. `llm_api_key_required_for_provider` is a `model_validator(mode="after")`.**
+It needs to cross-reference `llm_provider` with whichever API key field is present. Field validators run before the model is assembled; a `model_validator(mode="after")` runs on the complete model instance, so both fields are available. This is the correct Pydantic v2 pattern for cross-field validation.
+
+**4. `test_database_url` is optional (`str | None = None`).**
+The test database URL is only needed by the test suite, not by the running application. Making it required would break startup in environments that don't have a test DB (staging, production). The test suite reads it separately — it is not consumed by `database.py` or `get_db`.
+
+**5. `deps.py` is a re-export, not a new implementation.**
+`get_db` lives in `database.py` because it is tightly coupled to the engine and session factory defined there. `deps.py` re-exports it so routes have a stable, consistent import path (`from src.core.deps import get_db`) without pulling in the engine and session factory directly. If future shared dependencies are added (e.g., a `get_current_user` auth dependency), they live here too.
+
+**6. `extra="ignore"` in `SettingsConfigDict`.**
+The `.env` file likely contains Docker Compose variables, shell exports, and other platform vars that are not `Settings` fields. Without `extra="ignore"`, Pydantic raises a validation error on the first unexpected field it sees. Silently ignoring extras is the correct setting for a shared `.env` file.
+
+**7. `case_sensitive=False` in `SettingsConfigDict`.**
+Environment variable casing is platform-dependent. On Linux (the container runtime), env vars are case-sensitive. On Windows (the dev machine), they are not. Setting `case_sensitive=False` makes `Settings` behave consistently regardless of where the developer types the variable name in their shell.
+
+### Issues Found Mid-Task
+
+**`pydantic-settings` not installed in local Python environment.**
+Same pattern as Session 03 (`pydantic` was installed but `pydantic-settings` is a separate package). Installed locally for test validation. Not a code issue — Adam's Docker image has all dependencies from `pyproject.toml`.
+
+**No issues with the logic or the import chain.** All six validation tests passed on first run.
+
+### Self-Review Checklist
+
+- [x] `settings.py` imports without error
+- [x] `Settings` instantiates from explicit kwargs (tested without .env file present)
+- [x] Wrong `DATABASE_URL` driver prefix raises `ValueError` with clear message
+- [x] Missing API key for configured provider raises `ValueError` with clear message
+- [x] `CACHE_TTL_SECONDS=0` raises `ValueError` with clear message
+- [x] `get_settings()` returns the same object on second call (`is` check passes)
+- [x] OpenAI provider path validates correctly with only `openai_api_key` present
+- [x] `database.py` no longer imports `os` — `os.environ` removed
+- [x] `database.py` `_settings = get_settings()` at module scope (not inside `get_db`)
+- [x] `database.py` `echo=_settings.app_env == "development"` (not string hardcoded)
+- [x] `deps.py` imports without error
+- [x] `get_db` imported from `deps.py` is the same object as in `database.py`
+- [x] `get_db` confirmed as `isasyncgenfunction` (FastAPI requires a generator for dependency cleanup)
+- [x] No `Any` in type hints across all three files
+- [x] `get_settings.cache_clear()` is callable (lru_cache attribute available) — tests can reset it
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `get_settings() cached with lru_cache(maxsize=1)` — Settings instantiated once per process; env vars read at startup, not per-request; tests must call `get_settings.cache_clear()` before patching env vars
+- `database_url asyncpg validator in Settings` — catches wrong driver scheme at startup with a clear message, rather than letting SQLAlchemy fail at engine creation with a cryptic dialect error
+- `deps.py as stable import home for shared dependencies` — routes import from `src.core.deps`, not from `src.core.database` directly; prevents circular imports as the route layer grows; future shared deps (auth, pagination) live here
+
+**ARCHITECTURE.md:**
+- New component: `src/core/settings.py` — Pydantic `BaseSettings` singleton; all env var reads flow through here; validates configuration at startup before any DB connection is attempted
+- Updated component: `src/core/database.py` — `os.environ` replaced with `get_settings()`; engine now uses typed config fields, not raw string reads
+- New component: `src/core/deps.py` — shared FastAPI dependency re-export; stable import point for `get_db` and future shared dependencies
