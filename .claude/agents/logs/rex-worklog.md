@@ -6,6 +6,7 @@
 |---|--------|--------|--------------|
 | 01 | `database-models` | ✅ Done | `ARRAY(String)` for tags, named `orderstatus` enum, `expire_on_commit=False`, `os.environ` for DATABASE_URL (settings.py deferred to Commit 05) |
 | 02 | `alembic-initial-migration` | ✅ Done | Hand-written migration (no autogenerate); `orderstatus` enum created as standalone Postgres type with `create_type=False` + explicit `.create()` / `.drop()` to survive table drops |
+| 03 | `pydantic-schemas` | ✅ Done | `OrderStatus` imported from ORM model (single source of truth, no drift risk); `OrderItemRead` carries optional `meal_name` + `price_each` for agent readability; `IngredientStockUpdate` is absolute replacement (not delta) — documented in field description |
 
 ---
 
@@ -162,6 +163,87 @@ Without this template, `alembic revision` fails. Added the standard Alembic mako
 - New component: `alembic/` — migration layer; all schema changes tracked here; `env.py` is the async bridge between Alembic runner and the asyncpg engine
 - New component: `alembic.ini` — CLI configuration (points to `alembic/` as `script_location`)
 - Data flow addition: `alembic upgrade head` → `env.py` → `AsyncEngine (asyncpg)` → Postgres DDL
+
+---
+
+---
+
+## Session 03 — Commit 04: `pydantic-schemas`
+
+**Date:** 2026-04-17
+**Task:** Build all Pydantic v2 request/response schemas in `src/schemas/`. No logic — shapes only.
+
+### Task Brief
+
+Three schema files:
+- `src/schemas/meal.py` — `MealCreate`, `MealRead`, `MealListResponse`
+- `src/schemas/ingredient.py` — `IngredientCreate`, `IngredientRead`, `IngredientStockUpdate`
+- `src/schemas/order.py` — `OrderItemCreate`, `OrderCreate`, `OrderItemRead`, `OrderRead`, `OrderStatusUpdate`
+
+Constraints:
+- Pydantic v2 only — `ConfigDict`, `model_validator`, `Field(description=...)` on every field
+- `from_attributes=True` on all response schemas built from ORM objects
+- `OrderCreate` must reject an empty items list
+- `OrderStatus` must serialise as a plain string in JSON
+- No `Any` in type hints
+
+Read the five ORM models first. Decisions happen at schema design time, not at writing time.
+
+### Decisions Made
+
+**1. `OrderStatus` imported from `src.models.order`, not redefined.**
+Redefining the enum in the schema layer creates two sources of truth. If someone adds a state to the ORM enum and forgets to update the schema enum, the API silently accepts or rejects values it shouldn't. Importing the single definition means both layers are always in sync. The risk is a cross-layer import (schema importing from model) — this is acceptable and intentional; schemas are downstream consumers of model definitions.
+
+**2. `OrderItemRead` has optional `meal_name` and `price_each` fields.**
+The `OrderItem` ORM model does not store the meal name or price — it only stores `meal_id`. However, Nova's agent tools need to display readable order summaries, and the customer-facing order response should show what was ordered, not just foreign key IDs. The service layer can populate these by eagerly loading the `OrderItem.meal` relationship (via `selectinload`). Making them `Optional` (defaulting to `None`) means the schema works both with and without eager loading — routes that need performance can skip the join; routes that need readability can include it.
+
+**3. `IngredientStockUpdate.stock_quantity` is an absolute replacement, not a delta.**
+A delta-based update ("+50 grams") creates a race condition: two concurrent requests each add 50 grams when only one addition was intended. The absolute-value approach ("stock is now 200 grams") puts the responsibility for computing the correct new value on the caller, who must read the current value first. This is the safer pattern when there is no concurrency control at the API layer. The field description documents this explicitly.
+
+**4. `OrderCreate` uses both `min_length=1` on the field AND an explicit `model_validator`.**
+`min_length=1` is the Pydantic v2 native way to enforce a non-empty list — it catches the case before the validator runs. The `model_validator` is belt-and-suspenders and, more importantly, provides a human-readable error message rather than Pydantic's default field constraint message. Nova's agent reads error messages — specificity matters.
+
+**5. `MealCreate.price` and quantity fields use `Decimal` with `decimal_places=2`.**
+The ORM stores price as `Numeric(8, 2)`. Using `float` in the schema would introduce floating-point precision errors before the value even reaches the database. `Decimal` with `decimal_places=2` enforces the same precision at the API boundary. `gt=0` on price prevents zero-price meals from being created via the API.
+
+**6. `MealListResponse` wraps `list[MealRead]` with a `total` count.**
+A flat list response is technically valid but forces the caller to measure the list to know how many items there are. The `total` field adds no complexity and is always useful — particularly for Nova's agent tools which may need to reason about whether results were truncated. A future pagination extension would add `page` and `page_size` to this same schema.
+
+### Issues Found Mid-Task
+
+**No issues with the schema logic.** One environmental finding:
+
+**SQLAlchemy not installed in the local Python environment.**
+The project runs inside Docker, so local imports fail without installing the packages. Resolved by running `pip install sqlalchemy pydantic asyncpg` in the local environment for testing purposes. This is a dev-environment gap — not a code issue. Adam's Docker setup is the authoritative runtime.
+
+### Self-Review Checklist
+
+- [x] All three schema files import without errors (verified via Python import test)
+- [x] `MealCreate` rejects missing `price` (ValidationError raised)
+- [x] `OrderCreate` rejects empty `items=[]` (ValidationError raised)
+- [x] `OrderCreate` rejects missing `items` entirely (ValidationError raised)
+- [x] `OrderRead` serialises `status` as plain string `'PENDING'` via `model_dump(mode='json')` (FastAPI's code path)
+- [x] `MealRead.model_validate(mock_orm_obj)` works correctly (`from_attributes=True`)
+- [x] `IngredientStockUpdate` rejects `stock_quantity < 0`
+- [x] `OrderItemCreate` rejects `quantity=0`
+- [x] `Field(description=...)` on every single field across all schemas
+- [x] `model_config = ConfigDict(from_attributes=True)` on all response schemas: `MealRead`, `MealListResponse`, `IngredientRead`, `OrderItemRead`, `OrderRead`
+- [x] No `Any` in type hints anywhere
+- [x] `OrderStatus` not redefined — imported from `src.models.order`
+- [x] `OrderItemRead.meal_name` and `price_each` are `Optional` with `default=None` — schema is usable without eager loading
+- [x] `IngredientStockUpdate` description explicitly states absolute replacement (not delta)
+- [x] `model_json_schema()` generates correctly on `OrderRead` (verified — 3963 chars, no errors)
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `OrderStatus imported into schemas from ORM model (not redefined)` — single source of truth for enum states; schema layer is a downstream consumer of model definitions; prevents silent drift if states are added/removed
+- `OrderItemRead.meal_name and price_each as optional fields` — enables eager-loaded responses without requiring all callers to join; service layer populates from `selectinload(OrderItem.meal)`; Nova's tools benefit from readable summaries without raw FK IDs
+- `IngredientStockUpdate uses absolute value, not delta` — eliminates race condition on concurrent stock updates; caller is responsible for reading current value and computing new total
+
+**ARCHITECTURE.md:**
+- New component: `src/schemas/` — Pydantic v2 API contract layer; shapes for all three resource types (Meal, Ingredient, Order); no business logic, no DB access
+- Data flow addition: FastAPI route handler receives request → validated against `*Create` schema → service processes → returns ORM object → serialised via `*Read` schema with `from_attributes=True`
 
 ---
 

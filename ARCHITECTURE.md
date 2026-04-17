@@ -267,6 +267,34 @@ The join table is the correct relational pattern.
 
 ---
 
+## Schema Layer
+
+All API-facing data contracts live in `src/schemas/`. No business logic — shapes only.
+
+| File | Schemas |
+|---|---|
+| `src/schemas/meal.py` | `MealCreate`, `MealRead`, `MealListResponse` |
+| `src/schemas/ingredient.py` | `IngredientCreate`, `IngredientRead`, `IngredientStockUpdate` |
+| `src/schemas/order.py` | `OrderItemCreate`, `OrderCreate`, `OrderItemRead`, `OrderRead`, `OrderStatusUpdate` |
+
+**Key design choices:**
+- All response schemas (`*Read`) set `model_config = ConfigDict(from_attributes=True)` — they can be built directly from SQLAlchemy ORM objects
+- `OrderStatus` is imported from `src.models.order` (not redefined in the schema layer) — one enum, no drift
+- All fields carry `Field(description="...")` — improves Nova's structured output quality and auto-generates useful OpenAPI docs
+- `OrderItemRead` has optional `meal_name` and `price_each` — populated by the service when the `Meal` relationship is eagerly loaded via `selectinload`; routes that don't need meal details can skip the join
+
+**Data flow:**
+```
+FastAPI route receives request
+  → validated against *Create schema
+  → service layer processes (DB, cache, Celery)
+  → ORM object returned
+  → serialised via *Read schema (from_attributes=True)
+  → JSON response to caller
+```
+
+---
+
 ## Migration Layer
 
 All schema changes go through Alembic. No manual DDL. No `Base.metadata.create_all()` in production.

@@ -147,6 +147,40 @@ Each entry:
 
 ---
 
+## Commit 04 — pydantic-schemas
+
+---
+
+### D-12 · `OrderStatus` imported from ORM model into schema layer (not redefined)
+
+**What:** `src/schemas/order.py` imports `OrderStatus` from `src.models.order` rather than declaring a parallel enum.
+
+**Why:** Two enum definitions for the same concept means two places to update when a state is added or renamed, and a non-zero risk that they drift silently. The schema layer is a downstream consumer of the model definition — it should read from it, not duplicate it.
+
+**Raised by:** Rex (Commit 04)
+
+---
+
+### D-13 · `OrderItemRead.meal_name` and `price_each` as optional fields
+
+**What:** `OrderItemRead` carries `meal_name: str | None` and `price_each: Decimal | None`, both defaulting to `None`.
+
+**Why:** These values come from the eagerly-loaded `Meal` relationship (`selectinload`), not from the `OrderItem` row itself. Making them optional means the schema works with or without the join — routes that don't need the meal details skip `selectinload` and take the performance benefit. Nova's agent tools get readable order summaries when the join is included.
+
+**Raised by:** Rex (Commit 04)
+
+---
+
+### D-14 · `IngredientStockUpdate` replaces stock level absolutely (not a delta)
+
+**What:** `PATCH /ingredients/{id}/stock` accepts an absolute target value, not an increment or decrement.
+
+**Why:** A delta model (`+50g`) requires the API to perform a read-modify-write internally. Under concurrent requests this creates a race: two requests both read `100g`, both apply `+50g`, and both write `150g` instead of `200g`. An absolute value puts the read-compute-write responsibility on the caller — correct when there is no API-level locking or optimistic concurrency control.
+
+**Raised by:** Rex (Commit 04)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.
