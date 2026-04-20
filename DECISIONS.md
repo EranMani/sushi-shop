@@ -205,6 +205,36 @@ Each entry:
 
 ---
 
+### D-15 · Postgres FTS over combined name + tags tsvector
+
+**What:** `search_meals` builds a single tsvector by concatenating `to_tsvector('english', name)` and `to_tsvector('english', array_to_string(tags, ' '))`.
+
+**Why:** A search for "spicy" should match both a meal called "Spicy Tuna Roll" and a meal tagged `["spicy"]`. Searching only the name column misses tag-only matches; searching tags as an array requires array-specific operators. Converting tags to a space-joined string and combining the two tsvectors into one expression gives a single ranked search over both fields. Nova's agent tool calls this function directly — the quality of the result directly affects what the agent presents to the customer.
+
+**Raised by:** Rex (Commit 06)
+
+---
+
+### D-16 · `/meals/search` route declared before `/meals/{meal_id}`
+
+**What:** In `src/api/routes/meals.py`, the `GET /meals/search` route is registered before `GET /meals/{meal_id}`.
+
+**Why:** FastAPI resolves routes in declaration order. If `/{meal_id}` is declared first, a request to `/meals/search` is matched against it and FastAPI attempts to cast `"search"` to an integer, producing a 422 validation error instead of routing to the search handler. Declaration order is the correct fix — no path prefix tricks needed.
+
+**Raised by:** Rex (Commit 06)
+
+---
+
+### D-17 · Redis cache operations are non-fatal
+
+**What:** All cache reads and writes in `src/core/cache.py` are wrapped so that a Redis failure logs a warning and falls through to Postgres — no exception is raised to the caller.
+
+**Why:** Redis is a performance layer, not the source of truth. A Redis outage should degrade performance (more Postgres load), not take down the API. Making cache failures fatal would create an unnecessary hard dependency on Redis availability for every read-heavy route.
+
+**Raised by:** Rex (Commit 06)
+
+---
+
 ### D-14 · `IngredientStockUpdate` replaces stock level absolutely (not a delta)
 
 **What:** `PATCH /ingredients/{id}/stock` accepts an absolute target value, not an increment or decrement.

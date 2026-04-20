@@ -313,6 +313,32 @@ This keeps the agent decoupled from internal implementation and ensures the full
 
 ---
 
+## Service Layer
+
+Business logic lives in `src/services/`. Services are pure Python — no FastAPI dependencies inside them. `AsyncSession` is passed in as a parameter so services are testable in isolation.
+
+| File | Functions |
+|---|---|
+| `src/services/meal_service.py` | `create_meal`, `get_meal`, `get_meal_by_name`, `list_meals` (Redis-cached), `search_meals` (Postgres FTS) |
+| `src/services/ingredient_service.py` | `create_ingredient`, `get_ingredient`, `list_ingredients`, `update_stock` |
+
+**FTS implementation:** `search_meals` builds a combined tsvector over both `name` and `tags`:
+```sql
+to_tsvector('english', name) || to_tsvector('english', array_to_string(tags, ' '))
+```
+This means a query for "spicy" matches meals named "Spicy Tuna" and meals tagged `["spicy"]`. Nova's `search_meals` agent tool calls this function directly.
+
+**Cache strategy (`src/core/cache.py`):**
+- `menu:all` — full serialised meal list, TTL = `CACHE_TTL_SECONDS`. Invalidated on any Meal or Ingredient write.
+- `order:status:{id}` — current status string, TTL = 60s. Updated by the Celery kitchen worker.
+- All cache operations are non-fatal — Redis failure logs a warning and falls through to Postgres.
+
+**Route surface:**
+- `POST /meals`, `GET /meals`, `GET /meals/search?q=`, `GET /meals/{id}`
+- `POST /ingredients`, `GET /ingredients`, `GET /ingredients/{id}`, `PATCH /ingredients/{id}/stock`
+
+---
+
 ## Schema Layer
 
 All API-facing data contracts live in `src/schemas/`. No business logic — shapes only.

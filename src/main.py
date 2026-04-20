@@ -1,10 +1,9 @@
 # src/main.py — FastAPI application entry point
-#
-# Commit 01: Bare skeleton. Single health check route only.
-# Rex takes ownership of this file from Commit 02 onward.
-# Do not add application logic here until Rex's commits begin.
 
 from fastapi import FastAPI
+
+from src.api.routes.ingredients import router as ingredients_router
+from src.api.routes.meals import router as meals_router
 
 app = FastAPI(
     title="Sushi Shop",
@@ -12,8 +11,15 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# ─── Routers ──────────────────────────────────────────────────────────────────
 
-@app.get("/health")
+app.include_router(meals_router)
+app.include_router(ingredients_router)
+
+
+# ─── Health check ─────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["health"])
 async def health_check() -> dict[str, str]:
     """Health check endpoint used by Docker health checks and Nginx upstream monitoring."""
     return {"status": "ok"}

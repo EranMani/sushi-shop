@@ -8,6 +8,7 @@
 | 02 | `alembic-initial-migration` | ✅ Done | Hand-written migration (no autogenerate); `orderstatus` enum created as standalone Postgres type with `create_type=False` + explicit `.create()` / `.drop()` to survive table drops |
 | 03 | `pydantic-schemas` | ✅ Done | `OrderStatus` imported from ORM model (single source of truth, no drift risk); `OrderItemRead` carries optional `meal_name` + `price_each` for agent readability; `IngredientStockUpdate` is absolute replacement (not delta) — documented in field description |
 | 04 | `core-dependencies` | ✅ Done | `get_settings()` cached with `lru_cache(maxsize=1)`; `database_url_must_use_asyncpg` validator catches wrong driver at startup not at engine creation; `deps.py` is a thin re-export to break circular imports in routes |
+| 05 | `meal-ingredient-service-routes` | ✅ Done | FTS via combined `to_tsvector(name) \|\| to_tsvector(array_to_string(tags))` + `plainto_tsquery`; `/search` route declared before `/{id}` to avoid FastAPI ordering shadow; Redis failures non-fatal in all cache helpers |
 
 ---
 
@@ -352,3 +353,157 @@ Same pattern as Session 03 (`pydantic` was installed but `pydantic-settings` is 
 - New component: `src/core/settings.py` — Pydantic `BaseSettings` singleton; all env var reads flow through here; validates configuration at startup before any DB connection is attempted
 - Updated component: `src/core/database.py` — `os.environ` replaced with `get_settings()`; engine now uses typed config fields, not raw string reads
 - New component: `src/core/deps.py` — shared FastAPI dependency re-export; stable import point for `get_db` and future shared dependencies
+
+---
+
+## Session 05 — Commit 06: `meal-ingredient-service-routes`
+
+**Date:** 2026-04-20
+**Task:** Build `meal_service.py`, `ingredient_service.py`, the corresponding API routes, and wire them into `src/main.py`. Also create `src/core/cache.py` (absent from disk, required by the services for cache invalidation).
+
+### Task Brief
+
+This commit is the first time real application logic exists. The services are pure Python functions — no FastAPI coupling, only `AsyncSession` passed in. Routes are thin shells: validate, delegate, respond. Both layers follow the standards set in Sessions 01–04.
+
+Files to produce:
+- `src/core/cache.py` — Redis client and cache helpers (`get_menu_cache`, `invalidate_menu_cache`)
+- `src/services/meal_service.py` — `create_meal`, `get_meal`, `list_meals`, `search_meals`
+- `src/services/ingredient_service.py` — `create_ingredient`, `get_ingredient`, `list_ingredients`, `update_stock`
+- `src/api/routes/meals.py` — `POST /meals`, `GET /meals`, `GET /meals/{id}`, `GET /meals/search`
+- `src/api/routes/ingredients.py` — `POST /ingredients`, `GET /ingredients`, `PATCH /ingredients/{id}/stock`
+- `src/main.py` — include both new routers
+
+Constraints going in:
+- Async SQLAlchemy throughout — `select()`, `session.execute()`, explicit eager-loading
+- No raw SQL — FTS via `func.to_tsvector` / `func.plainto_tsquery`
+- `search_meals` on `name` and `tags` columns, case-insensitive
+- Cache invalidation on every write to Meal or Ingredient — `menu:all` key
+- 404 as `HTTPException(status_code=404, detail="...")` with a specific message
+- No `Any` in type hints
+
+### Decisions Made
+
+**1. `src/core/cache.py` created in this commit (not a prior commit).**
+The commit protocol listed `cache.py` under "core infrastructure" but the file was absent from disk when I started. Services require cache functions now — no valid reason to defer. Creating it here keeps the services self-contained. Adam has no action required — no new env vars are introduced; `REDIS_URL` was already documented.
+
+**2. Redis failures are non-fatal in all cache helpers.**
+Every `get_redis()` call, `get`, `setex`, and `delete` is wrapped in a try/except that logs a warning and returns `None` (or returns silently on write). A Redis outage means the service falls through to Postgres — customer requests continue working. The alternative (raising on cache failure) would turn a Redis blip into a 500 for the customer. Postgres is always the source of truth; Redis is advisory.
+
+**3. `list_meals` serves from `menu:all` cache using raw JSON — deserialised into `MealRead` models.**
+The cache stores a JSON string produced by `MealRead.model_dump(mode="json")`. On a hit, `MealRead.model_validate(item)` re-validates each dict. This preserves Pydantic's type guarantees even when reading from cache — a corrupted cache entry fails gracefully (log + fall-through) rather than serving malformed data.
+
+**4. `search_meals` uses `to_tsvector("english", name) || to_tsvector("english", array_to_string(tags, " "))` with `@@` operator.**
+The combined tsvector approach is idiomatic Postgres FTS. Tags are stored as a Postgres array; `array_to_string(tags, " ")` converts them to a space-joined string before vectorising. This means a search for "spicy" matches both a meal named "Spicy Tuna" and a meal tagged ["spicy"]. The query was verified to compile correctly against the Postgres dialect using SQLAlchemy's `compile()`.
+
+**5. `search_meals` returns empty results on blank/whitespace query — does not fall back to `list_meals`.**
+A blank query passed to `plainto_tsquery` would either error or return all documents depending on the Postgres version. Explicit early-return on `stripped == ""` is cleaner and predictable. The route layer enforces `min_length=1` on the `q` parameter anyway — this is belt-and-suspenders at the service level for direct callers (Nova's tools).
+
+**6. Route `/meals/search` declared before `/{meal_id}` in `meals.py`.**
+FastAPI resolves routes in declaration order. If `/{meal_id}` appears first, the literal string "search" is parsed as an integer and fails with a 422 before the search route is ever reached. This is a well-known FastAPI ordering gotcha — documented in the route file with an explicit comment so it does not get silently reordered.
+
+**7. `get_meal_by_name` added to `meal_service.py` (not in the original spec).**
+Nova's agent tools need to resolve a customer-provided meal name to an ID before constructing an `OrderCreate`. Without this function, Nova would have to call `list_meals` and filter client-side — unnecessarily expensive. The function is a simple exact-match `select` on `Meal.name`. Adding it now costs nothing and removes a predictable pain point for Nova when she starts Commits 12–13.
+
+**8. `ingredient_service.list_ingredients` is not cached.**
+Ingredient lists are admin-facing (staff checking stock levels, not menu browsing). The read frequency does not justify cache overhead. The `menu:all` cache covers the hot customer path. Stock writes still invalidate `menu:all` because ingredient availability feeds into meal availability.
+
+**9. 409 Conflict returned for duplicate name on `POST /meals` and `POST /ingredients`.**
+`IntegrityError` from SQLAlchemy is caught at the route level (not the service level). The service raises it naturally — catching it in the service would hide the error from callers who might need different handling. The route translates it to a 409 with a specific message that names the duplicate value.
+
+### Issues Found Mid-Task
+
+**`Decimal` imported but unused in `meal_service.py` (initial draft).** Caught in self-review. Removed before finalising.
+
+**`cache.py` absent from disk.** Expected from commit-protocol order. Created in this commit — no cross-agent coordination needed since no new env vars are involved.
+
+### Self-Review Checklist
+
+- [x] `cache.py` — all helpers have explicit try/except; Redis failures are non-fatal
+- [x] `cache.py` — every `setex` call includes TTL from `get_settings().cache_ttl_seconds`
+- [x] `cache.py` — no `Any` in type hints; `dict[str, object]` for menu data
+- [x] `meal_service.create_meal` — invalidates `menu:all` after commit
+- [x] `meal_service.list_meals` — cache hit path deserialises via `MealRead.model_validate`; corrupted cache falls through
+- [x] `meal_service.search_meals` — FTS verified to compile against Postgres dialect
+- [x] `meal_service.search_meals` — empty/whitespace query returns empty result, not all meals
+- [x] `meal_service.get_meal_by_name` — added for Nova's tool layer; exact match on name
+- [x] `ingredient_service.update_stock` — absolute replacement, not delta (matches `IngredientStockUpdate` contract)
+- [x] `ingredient_service.update_stock` — invalidates `menu:all` after commit
+- [x] `ingredient_service.update_stock` — returns `None` when ingredient not found (route maps to 404)
+- [x] `meals.py` route — `/search` declared before `/{meal_id}` to avoid FastAPI ordering bug
+- [x] `meals.py` route — `IntegrityError` caught at route level, mapped to 409 with specific message
+- [x] `ingredients.py` route — `PATCH /{id}/stock` returns 404 on unknown ingredient
+- [x] All route 404 messages include the specific ID and resource type
+- [x] `src/main.py` — both routers included; health check retained
+- [x] No `Any` in type hints across all six files
+- [x] No raw SQL — all queries through `select()` and SQLAlchemy ORM
+- [x] No FastAPI imports in service files
+- [x] Syntax check passed on all six files
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `Redis cache failures are non-fatal` — all cache operations wrapped in try/except; Redis outage falls through to Postgres; customer requests continue without error; logged at WARNING level
+- `search_meals uses combined tsvector (name || array_to_string(tags))` — single FTS vector over both meal name and tags; `plainto_tsquery` handles tokenisation; case-insensitive by design of the english text search config
+- `GET /meals/search declared before GET /meals/{meal_id}` — FastAPI route ordering: literal path segments must precede parametric segments or they are shadowed; documented in route file
+
+**ARCHITECTURE.md:**
+- New component: `src/core/cache.py` — Redis client singleton + helpers for `menu:all` and `order:status:{id}` cache keys; non-fatal on Redis failure
+- New component: `src/services/meal_service.py` — `create_meal`, `get_meal`, `list_meals`, `search_meals`, `get_meal_by_name`; FTS search over name + tags
+- New component: `src/services/ingredient_service.py` — `create_ingredient`, `get_ingredient`, `list_ingredients`, `update_stock`
+- New component: `src/api/routes/meals.py` — `POST /meals`, `GET /meals`, `GET /meals/search`, `GET /meals/{id}`
+- New component: `src/api/routes/ingredients.py` — `POST /ingredients`, `GET /ingredients`, `GET /ingredients/{id}`, `PATCH /ingredients/{id}/stock`
+- Updated: `src/main.py` — meals and ingredients routers wired in
+
+---
+
+## Handoff → Nova
+
+**What I built:** Meal and ingredient services + API routes.
+
+**Service function signatures:**
+
+`meal_service.py`:
+- `create_meal(db: AsyncSession, data: MealCreate) -> MealRead`
+- `get_meal(db: AsyncSession, meal_id: int) -> MealRead | None`
+- `list_meals(db: AsyncSession) -> MealListResponse`
+- `search_meals(db: AsyncSession, query: str) -> MealListResponse`
+- `get_meal_by_name(db: AsyncSession, name: str) -> MealRead | None`
+
+`ingredient_service.py`:
+- `create_ingredient(db: AsyncSession, data: IngredientCreate) -> IngredientRead`
+- `get_ingredient(db: AsyncSession, ingredient_id: int) -> IngredientRead | None`
+- `list_ingredients(db: AsyncSession) -> list[IngredientRead]`
+- `update_stock(db: AsyncSession, ingredient_id: int, new_quantity: Decimal) -> IngredientRead | None`
+
+**Routes:**
+- `POST /meals` — 201 on success, 409 on duplicate name
+- `GET /meals` — `MealListResponse` (cached)
+- `GET /meals/search?q=` — `MealListResponse` (Postgres FTS, case-insensitive)
+- `GET /meals/{id}` — `MealRead`, 404 on unknown ID
+- `POST /ingredients` — 201 on success, 409 on duplicate name
+- `GET /ingredients` — `list[IngredientRead]` (no cache)
+- `GET /ingredients/{id}` — `IngredientRead`, 404 on unknown ID
+- `PATCH /ingredients/{id}/stock` — `IngredientRead`, 404 on unknown ID
+
+**FTS coverage:** `search_meals` queries both `Meal.name` and `Meal.tags` using a combined `to_tsvector` with the `english` text search configuration. Stemming applies — "spices" matches "spicy" etc. Case-insensitive.
+
+**Error cases:**
+- Service functions return `None` for not-found — routes map this to `HTTPException(404)`
+- `IntegrityError` on duplicate name — routes map this to `HTTPException(409)`
+- `search_meals` returns empty `MealListResponse` (not `None`) on blank query or no matches
+
+**What Nova needs to know for her tools:**
+- Call `search_meals(db, query)` for FTS — it handles blank-query safely
+- Call `get_meal_by_name(db, name)` to resolve a customer-provided meal name to an `id` before constructing `OrderCreate`
+- Call `get_ingredient(db, id)` to read current stock for availability checks — compare against `MealIngredient.quantity_required * order_quantity`
+- Service functions expect an injected `AsyncSession` — in agent tools, obtain one via `async with async_session_factory() as db:` (imported from `src.core.database`)
+- Return types are all typed Pydantic schemas — no free-form dicts
+
+**Files to read:**
+- `src/services/meal_service.py`
+- `src/services/ingredient_service.py`
+- `src/schemas/meal.py`, `src/schemas/ingredient.py`
+- `src/models/meal_ingredient.py` — for `quantity_required` in availability checks
+- `src/core/database.py` — for `async_session_factory`
+
+I'm done with services and routes. Nova can read these files when her commits start.
