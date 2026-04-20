@@ -6,7 +6,9 @@
       "Bash(rm .claude/agents/axel.md .claude/agents/logs/axel-worklog.md)",
       "Bash(pip install *)",
       "Bash(pip show *)",
-      "Bash(python -)"
+      "Bash(python -)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
