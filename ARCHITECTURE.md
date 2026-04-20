@@ -289,6 +289,30 @@ process start
 
 ---
 
+## Layer Dependency Chain
+
+Each layer depends only on the layers below it. Nothing reaches upward.
+
+```
+Models          — source of truth; define what exists in the database
+  └→ Schemas    — data contracts; reference model types and enums
+       └→ Services    — business logic; validate input via schemas, query models
+            └→ Routes      — HTTP handlers; call services, validate requests via schemas
+                  └→ Agent tools  — reads call services directly; writes POST to routes via httpx
+```
+
+**Why this order matters for builds:**
+- You cannot write schemas before models (schemas reference ORM enums and types)
+- You cannot write services before schemas (services use `*Create` / `*Read` shapes)
+- You cannot write routes before services (routes are thin wrappers around service calls)
+- Nova cannot build agent tools before Rex finishes services and routes
+
+**The one exception — `dispatch_order`:**
+The agent's order dispatch tool calls `POST /orders` via httpx rather than calling the service directly.
+This keeps the agent decoupled from internal implementation and ensures the full validation + state machine + Celery dispatch chain runs on every order, regardless of who places it.
+
+---
+
 ## Schema Layer
 
 All API-facing data contracts live in `src/schemas/`. No business logic — shapes only.
