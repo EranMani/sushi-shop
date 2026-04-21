@@ -83,6 +83,19 @@ class Settings(BaseSettings):
     Lower values mean fresher data but more database load.
     """
 
+    kitchen_prep_time_seconds: int = 5
+    """Simulated kitchen preparation time in seconds.
+
+    The Celery kitchen worker sleeps for this duration between the
+    PENDING → PREPARING and PREPARING → READY transitions, simulating
+    real-world order preparation time.
+
+    Default is 5 seconds — short enough for development and integration
+    tests without a dedicated mock, but long enough to observe the state
+    machine progressing in a running system. Set to 1 or 2 in test
+    environments if you need faster cycle times.
+    """
+
     # ─── Validators ───────────────────────────────────────────────────────────
 
     @field_validator("database_url")

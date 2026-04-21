@@ -332,6 +332,9 @@ This means a query for "spicy" matches meals named "Spicy Tuna" and meals tagged
 **Celery app (`src/core/celery_app.py`):**
 Redis is used as both broker and result backend. Two queues: `kitchen.orders` (primary) and `kitchen.dlq` (dead-letter). `task_acks_late=True` and `task_reject_on_worker_lost=True` prevent silent task loss under any worker failure mode. The kitchen task module (`src/tasks/kitchen.py`) is registered via `include=["src.tasks.kitchen"]`.
 
+**Kitchen worker (`src/tasks/kitchen.py`):**
+`process_order` is a sync Celery task (`bind=True`, `max_retries=1`, `default_retry_delay=10s`) that bridges into async via a single `asyncio.run(_async_process_order(order_id))` call. The full async body runs in one event loop with one `AsyncSession` for its lifetime — two status transitions, one session, one loop. The task is idempotent: current status is read before each transition and already-applied transitions are skipped, making it safe to retry after a partial execution. `KITCHEN_PREP_TIME_SECONDS` (default 5s, configurable via env var) controls the simulated prep delay between transitions. DLQ routing and FAILED status handling on exhausted retries belong to Commit 10.
+
 **Cache strategy (`src/core/cache.py`):**
 - `menu:all` — full serialised meal list, TTL = `CACHE_TTL_SECONDS`. Invalidated on any Meal or Ingredient write.
 - `order:status:{id}` — current status string, TTL = 60s. Updated by the Celery kitchen worker.

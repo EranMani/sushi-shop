@@ -15,6 +15,14 @@ Each entry:
 
 ---
 
+## Commit 09 — celery-kitchen-worker
+
+**Concept:** Bridging sync Celery tasks into async SQLAlchemy with `asyncio.run()`
+
+**Why it matters here:** Celery workers run in a plain sync Python process — there is no event loop. But `update_order_status` is an `async def` function that requires one. The bridge: factor all async work into a single `async def` coroutine (`_async_process_order`), then call `asyncio.run(coroutine)` from the sync task body. `asyncio.run()` creates a fresh event loop, runs the coroutine to completion, and tears the loop down. The key design choice is doing this *once* for the full task lifetime — not once per `await`. Two `asyncio.run()` calls would mean two separate event loops, two `AsyncSession` instances, and a gap between them. One call, one session, one loop is cheaper and keeps the two status transitions within the same session scope.
+
+---
+
 ## entrypoint.sh / PID 1 fix (post Commit 01)
 
 **Concept:** PID 1 and graceful shutdown in Docker containers

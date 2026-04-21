@@ -11,6 +11,7 @@
 | 04 | `core-dependencies` | ✅ Done | `get_settings()` cached with `lru_cache(maxsize=1)`; `database_url_must_use_asyncpg` validator catches wrong driver at startup not at engine creation; `deps.py` is a thin re-export to break circular imports in routes |
 | 05 | `meal-ingredient-service-routes` | ✅ Done | FTS via combined `to_tsvector(name) \|\| to_tsvector(array_to_string(tags))` + `plainto_tsquery`; `/search` route declared before `/{id}` to avoid FastAPI ordering shadow; Redis failures non-fatal in all cache helpers |
 | 07 | `redis-cache-layer` | ✅ Done | Fixed `order:status:{id}` TTL to 60s (was incorrectly using `CACHE_TTL_SECONDS`); added `get_order_status` as the cache-read path for lightweight status polling; `Depends` injection rejected as inappropriate for service-layer cache helpers |
+| 08 | `celery-kitchen-worker` | ✅ Done | Single `asyncio.run()` over one async coroutine bridges sync Celery → async service; `bind=True` + `self.retry()` for safe retry triggering; idempotency guard reads current status before each transition |
 
 ---
 
@@ -760,3 +761,107 @@ The read path was implemented in `cache.py` but never imported or called. `order
 - `src/core/cache.py` — `get_cached_order_status` / `set_cached_order_status` (60s TTL)
 
 No route shape changes. No new error cases.
+
+---
+
+---
+
+## Session 08 — Commit 09: `celery-kitchen-worker`
+
+**Date:** 2026-04-21
+**Task:** Replace the `process_order` stub in `src/tasks/kitchen.py` with the full PENDING → PREPARING → READY state machine implementation. Add `KITCHEN_PREP_TIME_SECONDS` to settings.
+
+### Task Brief
+
+The stub has been in place since Commit 07 — the import chain resolved, but the task body was a no-op. This commit replaces it with a real Celery task that:
+1. Reads the current order status from Postgres (idempotency guard)
+2. Transitions PENDING → PREPARING via `update_order_status` (which also writes to Redis)
+3. Sleeps for the configured prep time
+4. Transitions PREPARING → READY via `update_order_status`
+
+Key constraint: Celery tasks are sync; `update_order_status` is async. The bridge must not leave any dangling event loops or create unnecessary overhead.
+
+### Decisions Made
+
+**1. Single `asyncio.run()` over one async coroutine — not two separate `asyncio.run()` calls.**
+The entire task body is factored into `_async_process_order(order_id)`, a single `async def` coroutine that manages one `AsyncSession` for its full lifetime. `asyncio.run()` creates one event loop, runs the coroutine to completion, and tears the loop down. The alternative — two `asyncio.run()` calls (one per transition) — would create and destroy two event loops and two sessions for a single task execution. More importantly, it would leave a gap between the two calls where the session is closed mid-task, which is confusing and slightly wasteful. One coroutine, one loop, one session is the clean pattern.
+
+**2. `bind=True` + `self.retry(exc=exc)` instead of `process_order.retry(exc=exc)`.**
+When not using `bind=True`, calling `process_order.retry()` from inside the function body references the module-level name `process_order`. At module load time this is fine (the decorator has been applied), but it's fragile — if the module is ever restructured or the function renamed, the reference could break silently. `bind=True` injects `self` (the Celery Task instance) as the first argument, making `self.retry()` unambiguous and independent of how the task is named or where it lives in the module. This is also the pattern the Celery documentation recommends for tasks that need retry access.
+
+**3. `self` typed as `Any` with an inline explanation — acceptable use of `Any`.**
+`celery.app.task.Task` is importable, but importing it just for a type annotation on a private argument adds a dependency on Celery internals with no runtime benefit. `bind=True` guarantees the type at runtime. This is one of the rare cases where `Any` is genuinely the right call — documented in the docstring per project rules.
+
+**4. Idempotency guard reads current status before each phase, not before the whole task.**
+A simpler guard would read the status once at the start and bail if it's already READY. That works for a retry that happens before any work is done. But the real retry risk is a worker crash after PENDING → PREPARING completes but before PREPARING → READY. In that case, status is PREPARING when the retry runs — reading status once at the top would let the task proceed, but then calling `update_order_status(db, order_id, PREPARING)` again would raise `ValueError` (invalid transition). The guard handles the PREPARING case explicitly: skip the first transition, still run the sleep and the second transition.
+
+**5. `await asyncio.sleep(prep_time)` not `time.sleep(prep_time)`.**
+The prep time sleep happens inside the async coroutine, which runs in an event loop. `time.sleep` would block the event loop thread. Since Python's asyncio uses a single thread, this would also block any other coroutines running in that loop. `asyncio.sleep` yields control back to the loop scheduler correctly. In practice this task is the only coroutine in the loop (it runs inside `asyncio.run()`), but using `asyncio.sleep` is correct and forward-compatible.
+
+**6. `KITCHEN_PREP_TIME_SECONDS` added to `Settings` with default 5.**
+5 seconds is short enough that tests can run without a dedicated mock (just wait 5s), but long enough that you can observe the PREPARING state in a running system. The field description explicitly calls out the test use case. The prior default would have been hardcoded 30 (the commit spec's example), which would make every integration test a 30-second wait.
+
+**7. `Order` and `select` imports moved to module level (not inline in `_async_process_order`).**
+Initial draft had these as inline imports inside the function body to avoid a circular import concern. After review: there is no circular import here. `kitchen.py` imports from `order_service.py`; `order_service.py` imports from `kitchen.py` (for `process_order.delay()`). That IS a circular import, but it's already present in the stub — the stub already imports `celery_app` from `src.core.celery_app`, and `order_service` imports `process_order` from `kitchen`. Adding `Order` and `select` at the top of `kitchen.py` does not change the circular import situation. Inline imports are a PEP 8 violation without a genuine circular import reason — moved to module level.
+
+**Wait — circular import re-examined:**
+`kitchen.py` imports `update_order_status` from `order_service.py`. `order_service.py` imports `process_order` from `kitchen.py`. Python resolves this via the module cache (the first module to be partially loaded is referenced by the second before it is fully loaded). This is fine as long as neither module tries to use the imported name at module load time (i.e., both imports are only used inside function bodies, not at module scope). Both are — `update_order_status` is only called inside `_async_process_order`, and `process_order.delay()` is only called inside `create_order`. The circular import is safe.
+
+### Issues Found Mid-Task
+
+**Inline imports in `_async_process_order` were a PEP 8 violation.** No circular import risk was present — moved to module level.
+
+**`process_order.retry()` referenced from non-bind task is fragile.** Switched to `bind=True` + `self.retry()` before finalising. See Decision 2 above.
+
+### Self-Review Checklist
+
+- [x] `process_order` is a regular `def` function (not `async def`) — Celery requirement
+- [x] `bind=True` on the decorator — `self.retry()` available inside the body
+- [x] `asyncio.run(_async_process_order(order_id))` — single event loop per task execution
+- [x] `_async_process_order` opens its own `AsyncSession` via `async_session_factory`
+- [x] Status read before first transition — idempotency guard for PENDING and PREPARING cases
+- [x] READY early return — idempotent no-op if both transitions already completed
+- [x] `await asyncio.sleep(prep_time)` — not `time.sleep` (correct inside async context)
+- [x] `update_order_status(db, order_id, PREPARING)` called first, then sleep, then `update_order_status(db, order_id, READY)` — correct order
+- [x] `update_order_status` handles cache invalidation + re-caching internally — kitchen.py does not touch Redis directly
+- [x] `max_retries=1`, `default_retry_delay=10` on the decorator — retry plumbing ready for Commit 10
+- [x] `raise self.retry(exc=exc)` in the except handler — correct Celery retry trigger
+- [x] `KITCHEN_PREP_TIME_SECONDS` added to `Settings` with default 5 and clear docstring
+- [x] `Any` usage on `self` documented in docstring per project rules
+- [x] No FastAPI imports in `kitchen.py`
+- [x] No raw SQL — status read via `select(Order.status)` through SQLAlchemy
+- [x] `Order` and `select` imported at module level (not inline)
+- [x] Logging at INFO level for every state transition, ERROR on failure with `exc_info=True`
+- [x] `time.monotonic()` for elapsed timing — correct for wall-clock measurement
+- [x] Syntax check passed on both files
+
+### Scope Overflow Check
+
+The commit spec says DLQ routing and FAILED status handling belong to Commit 10. This commit:
+- Sets `max_retries=1` and `default_retry_delay=10` — retry plumbing ready
+- Does NOT implement the `on_failure` handler that routes to `kitchen.dlq`
+- Does NOT set order status to FAILED anywhere
+
+No scope overflow. Commit 10 owns all of that.
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `asyncio.run() bridge pattern for Celery + async SQLAlchemy` — single `asyncio.run()` over one coroutine is cheaper and cleaner than two calls; one session for the full task lifetime; avoids event loop creation overhead and session lifecycle gaps between transitions
+- `bind=True + self.retry() on Celery task` — `self.retry()` is unambiguous and independent of module-level naming; preferred over `task_name.retry()` which relies on the module-level reference being resolved correctly at retry time
+- `KITCHEN_PREP_TIME_SECONDS with default 5s` — configurable via env var; short enough for integration tests without mocking, long enough to observe PREPARING state in a running system
+
+**ARCHITECTURE.md:**
+- Updated component: `src/tasks/kitchen.py` — stub replaced with full implementation; `process_order` is a sync Celery task bridging to async via `asyncio.run(_async_process_order(order_id))`; state machine: PENDING → PREPARING (read from Postgres) → sleep → PREPARING → READY; idempotent on retry
+- Updated component: `src/core/settings.py` — `KITCHEN_PREP_TIME_SECONDS` added (default: 5)
+
+---
+
+## Handoff → Adam
+
+**What changed:** New environment variable `KITCHEN_PREP_TIME_SECONDS` added to `Settings`.
+
+**Why it matters for the container:** The Celery worker reads this value to know how long to sleep between order state transitions. Without it in `.env.example`, developers won't know it exists and won't be able to tune it for their environment.
+
+**What you need to update:**
+- `.env.example` — add `KITCHEN_PREP_TIME_SECONDS=5` with a comment explaining it controls the simulated kitchen prep delay; mention it can be set lower (e.g. 1 or 2) in test/CI environments for faster cycle times

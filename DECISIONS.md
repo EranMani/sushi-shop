@@ -299,6 +299,50 @@ Each entry:
 
 ---
 
+## Commit 09 — celery-kitchen-worker
+
+---
+
+### D-26 · `asyncio.run()` bridge — single call over one coroutine for the full task lifetime
+
+**What:** `process_order` (sync Celery task) calls `asyncio.run(_async_process_order(order_id))` once, running both status transitions and the prep sleep inside a single event loop with one `AsyncSession`.
+
+**Why:** Celery workers have no event loop — every async call needs a bridge. The alternative is two separate `asyncio.run()` calls (one per `update_order_status`). That approach creates two event loops, two sessions, and a gap between them where the order is PREPARING in Postgres but has no active session. A single `asyncio.run()` over one coroutine keeps the whole task atomic at the session level: one session opens, both transitions execute, session closes. Cheaper and safer.
+
+**Raised by:** Rex (Commit 09)
+
+---
+
+### D-27 · `bind=True` + `self.retry()` instead of module-level name reference
+
+**What:** The task decorator uses `bind=True` so the Celery `Task` instance is available as `self`. Retry is triggered with `self.retry(exc=exc)`, not `process_order.retry(exc=exc)`.
+
+**Why:** `process_order.retry()` requires the module-level name `process_order` to be resolved at retry time. Inside a task body, the module may not be fully loaded or the name may not be in scope in all execution paths. `self.retry()` resolves the Task instance directly from the bound argument — always available, no name lookup. It is the Celery-idiomatic pattern for retry inside a bound task.
+
+**Raised by:** Rex (Commit 09)
+
+---
+
+### D-28 · Idempotency guard via pre-transition status read
+
+**What:** Before each `update_order_status` call, the current order status is read from Postgres. If the transition has already been applied (e.g. order is already PREPARING on retry), the transition is skipped.
+
+**Why:** `update_order_status` raises `ValueError` on an invalid transition. If the task is retried after PENDING → PREPARING succeeded but the worker crashed before PREPARING → READY, calling `update_order_status(PREPARING)` a second time would raise — the state machine correctly rejects it. The idempotency guard detects this and fast-forwards to the remaining work. Makes the task safe to retry at any point without corrupting order state.
+
+**Raised by:** Rex (Commit 09)
+
+---
+
+### D-29 · `KITCHEN_PREP_TIME_SECONDS` default 5s — configurable, not hardcoded
+
+**What:** The simulated prep delay is read from `settings.kitchen_prep_time_seconds` (default 5). Not hardcoded in the task.
+
+**Why:** A hardcoded value (e.g. 30s) makes integration tests painful — every test that creates an order and polls for READY must wait 30 seconds. 5 seconds is short enough to observe the state machine in a running system without making tests slow. Setting `KITCHEN_PREP_TIME_SECONDS=1` in a CI `.env` gives fast cycle times with no code changes.
+
+**Raised by:** Rex (Commit 09)
+
+---
+
 ## Commit 08 — redis-cache-layer
 
 ---
