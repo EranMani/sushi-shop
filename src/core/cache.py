@@ -129,17 +129,23 @@ async def get_cached_order_status(order_id: int) -> str | None:
 
 
 async def set_cached_order_status(order_id: int, status: str) -> None:
-    """Cache the status string for an order with the configured TTL.
+    """Cache the status string for an order with a fixed 60-second TTL.
+
+    Order status is intentionally cached for a shorter window than the menu
+    (60s vs CACHE_TTL_SECONDS). Status changes happen on every Celery transition
+    and a customer polling their order should not wait more than 60s to see the
+    new state. Using the full CACHE_TTL_SECONDS (300s default) would make the
+    cache misleading — a PREPARING order would appear PREPARING to the customer
+    even 4 minutes after it reached READY.
 
     Args:
         order_id: Primary key of the order.
         status:   The status string (e.g. "PENDING", "PREPARING", "READY", "FAILED").
     """
-    settings = get_settings()
     client = get_redis()
     key = order_status_key(order_id)
     try:
-        await client.setex(key, settings.cache_ttl_seconds, status)
+        await client.setex(key, 60, status)
     except Exception as exc:
         logger.warning("Redis SETEX failed for key '%s': %s", key, exc)
 

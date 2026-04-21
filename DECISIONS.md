@@ -299,6 +299,40 @@ Each entry:
 
 ---
 
+## Commit 08 — redis-cache-layer
+
+---
+
+### D-23 · `order:status:{id}` TTL fixed at 60s — not `CACHE_TTL_SECONDS`
+
+**What:** The `set_cached_order_status` helper uses a hard-coded 60-second TTL. The menu cache uses the configurable `CACHE_TTL_SECONDS` (default 300s). The two caches intentionally use different TTLs.
+
+**Why:** Order status changes on every Celery state transition. A 300s TTL means a customer polling their order could see a stale PREPARING status for up to 5 minutes after the order reached READY. The 60s window balances responsiveness (a customer sees their order is READY within a minute) against Postgres load reduction (status polls still hit Redis rather than Postgres on every check). The menu write frequency is low — 300s is safe. Order status write frequency is high — 300s is misleading.
+
+**Raised by:** Rex (Commit 08, audit finding — TTL was incorrectly set to `settings.cache_ttl_seconds`)
+
+---
+
+### D-24 · `get_order_status` as a dedicated lightweight status-poll function
+
+**What:** `order_service.get_order_status(db, order_id) -> str | None` is a separate function that returns only the status string — it does not load order items or meal names. It checks the Redis cache first; on a miss, runs a single-column `select(Order.status)` query and re-caches the result.
+
+**Why:** Nova's agent polls order status frequently during the kitchen simulation. `get_order` is not suitable for this — it loads the full order with `selectinload(items).selectinload(meal)`, which is correct for displaying order details but wasteful for a status-only check. Separating the two functions means polling is cheap (Redis hit or single-column Postgres query) and the full order load happens only when the customer needs order details.
+
+**Raised by:** Rex (Commit 08)
+
+---
+
+### D-25 · `Depends` injection not used for cache helpers in the service layer
+
+**What:** Cache helpers are imported directly in service functions (`from src.core.cache import ...`). `Depends(...)` is not used for cache injection in the service layer.
+
+**Why:** `Depends` is a FastAPI mechanism — it only works inside route handler function signatures where FastAPI manages the dependency resolution lifecycle. Service functions are pure Python callables invoked from routes, Celery tasks, and test fixtures. Forcing `Depends` into service signatures would break all non-route callers. Direct import is the correct pattern for the service layer.
+
+**Raised by:** Rex (Commit 08)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.

@@ -25,7 +25,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.core.cache import invalidate_order_status_cache, set_cached_order_status
+from src.core.cache import (
+    get_cached_order_status,
+    invalidate_order_status_cache,
+    set_cached_order_status,
+)
 from src.models.meal import Meal
 from src.models.order import Order, OrderStatus
 from src.models.order_item import OrderItem
@@ -221,6 +225,47 @@ async def get_order(db: AsyncSession, order_id: int) -> OrderRead | None:
     if order is None:
         return None
     return _build_order_read(order)
+
+
+async def get_order_status(db: AsyncSession, order_id: int) -> str | None:
+    """Return the current status string for an order, using the Redis cache.
+
+    This is the lightweight status-poll path used by Nova's agent when it needs
+    to check whether an order has progressed without loading the full order
+    (items, meal names, prices). The cache key is `order:status:{id}` with a
+    60-second TTL — set by `update_order_status` after every Celery transition.
+
+    On a cache miss, fetches the status column from Postgres directly (no items
+    join) and re-populates the cache.
+
+    Args:
+        db:       An active async database session.
+        order_id: Primary key of the order to check.
+
+    Returns:
+        The status string (e.g. "PENDING", "PREPARING", "READY", "FAILED") if
+        the order exists, or `None` if no order with that ID is found.
+    """
+    # Attempt cache hit — status string is stored as a plain string value.
+    cached_status = await get_cached_order_status(order_id)
+    if cached_status is not None:
+        logger.debug("Cache hit for order status id=%d: %s", order_id, cached_status)
+        return cached_status
+
+    # Cache miss — query Postgres for the status column only (no items join).
+    # select(Order.status) returns an OrderStatus enum instance via scalar_one_or_none.
+    result = await db.execute(
+        select(Order.status).where(Order.id == order_id)
+    )
+    status_enum: OrderStatus | None = result.scalar_one_or_none()
+    if status_enum is None:
+        return None
+
+    status_str: str = status_enum.value
+    # Re-populate the cache so the next poll within 60s is served from Redis.
+    await set_cached_order_status(order_id, status_str)
+    logger.debug("Cache miss for order status id=%d — re-cached: %s", order_id, status_str)
+    return status_str
 
 
 async def list_orders(db: AsyncSession) -> list[OrderRead]:

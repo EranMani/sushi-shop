@@ -321,7 +321,7 @@ Business logic lives in `src/services/`. Services are pure Python — no FastAPI
 |---|---|
 | `src/services/meal_service.py` | `create_meal`, `get_meal`, `get_meal_by_name`, `list_meals` (Redis-cached), `search_meals` (Postgres FTS) |
 | `src/services/ingredient_service.py` | `create_ingredient`, `get_ingredient`, `list_ingredients`, `update_stock` |
-| `src/services/order_service.py` | `create_order`, `get_order`, `list_orders`, `update_order_status` |
+| `src/services/order_service.py` | `create_order`, `get_order`, `get_order_status` (cache-first), `list_orders`, `update_order_status` |
 
 **FTS implementation:** `search_meals` builds a combined tsvector over both `name` and `tags`:
 ```sql

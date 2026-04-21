@@ -10,6 +10,7 @@
 | 03 | `pydantic-schemas` | ✅ Done | `OrderStatus` imported from ORM model (single source of truth, no drift risk); `OrderItemRead` carries optional `meal_name` + `price_each` for agent readability; `IngredientStockUpdate` is absolute replacement (not delta) — documented in field description |
 | 04 | `core-dependencies` | ✅ Done | `get_settings()` cached with `lru_cache(maxsize=1)`; `database_url_must_use_asyncpg` validator catches wrong driver at startup not at engine creation; `deps.py` is a thin re-export to break circular imports in routes |
 | 05 | `meal-ingredient-service-routes` | ✅ Done | FTS via combined `to_tsvector(name) \|\| to_tsvector(array_to_string(tags))` + `plainto_tsquery`; `/search` route declared before `/{id}` to avoid FastAPI ordering shadow; Redis failures non-fatal in all cache helpers |
+| 07 | `redis-cache-layer` | ✅ Done | Fixed `order:status:{id}` TTL to 60s (was incorrectly using `CACHE_TTL_SECONDS`); added `get_order_status` as the cache-read path for lightweight status polling; `Depends` injection rejected as inappropriate for service-layer cache helpers |
 
 ---
 
@@ -653,3 +654,109 @@ Function signatures:
 - `src/tasks/kitchen.py` — stub only; full implementation in Commit 09
 
 I'm done. Nova can start when her commits are due.
+
+---
+
+---
+
+## Session 07 — Commit 08: `redis-cache-layer`
+
+**Date:** 2026-04-21
+**Task:** Audit the existing Redis cache implementation against the commit spec, fix gaps, and confirm the testing criteria are satisfiable.
+
+### Task Brief
+
+The commit spec documents three cache requirements: `menu:all` with `CACHE_TTL_SECONDS` TTL, `order:status:{id}` with 60s TTL, and invalidation on every Meal/Ingredient write. The spec also says cache helpers should be "injected into services via `Depends`" and that the `get_order` path should check cache before hitting Postgres.
+
+Starting position: `cache.py` was fully created in Commit 06 as an unplanned prerequisite. The meal service already uses it correctly. The order service calls `set_cached_order_status` and `invalidate_order_status_cache` in `update_order_status`. But several gaps remained.
+
+### Decisions Made
+
+**1. `order:status:{id}` TTL fixed to 60s (not `CACHE_TTL_SECONDS`).**
+The prior implementation passed `settings.cache_ttl_seconds` (300s default) as the TTL for order status. The commit spec explicitly requires 60s. The reasoning is sound: order status changes on every Celery transition (PENDING → PREPARING → READY), and a 300s TTL would serve stale status to a customer whose order reached READY within the last 4 minutes. The menu changes infrequently; order status changes constantly. Different data, different TTL requirements. Fixed to hard-coded 60 in `set_cached_order_status`, with a full docstring explaining the reasoning.
+
+**2. Added `get_order_status` as a dedicated cache-read function — not modifying `get_order`.**
+The existing `get_order` returns a full `OrderRead` including items eagerly loaded from Postgres. Adding a cache check inside `get_order` would be wrong: the cache only stores the status string, not the full order. A cache hit there would give us the status but we'd still need the items from Postgres. There is nothing to save. The right separation is a dedicated `get_order_status` function that:
+- Checks `get_cached_order_status` first (pure status string)
+- On cache miss, runs `select(Order.status)` — no items join — and re-caches the result
+- Returns the status string (not `OrderRead`)
+
+This is the lightweight polling path Nova's agent will use when checking whether an order is ready, without loading full order details every poll cycle.
+
+**3. `Depends` injection rejected for service-layer cache helpers.**
+The commit spec says "Injected into services via `Depends`". After reading the actual service code, `Depends` is a FastAPI mechanism — it is valid in route handler function signatures, not in pure Python service functions. The services receive an `AsyncSession` via `Depends(get_db)` at the route layer, but the services themselves are plain async functions called from routes (and from Celery tasks and test fixtures). Forcing a Redis client into service function signatures via `Depends` would:
+- Require all callers (Celery tasks, tests, agent tools) to construct a fake FastAPI dependency context
+- Break the "pure Python, no FastAPI imports" rule on services
+
+The correct interpretation of "injected via `Depends`" applies to the route layer calling the cache at the route level — but since we correctly placed cache logic in the service layer (closer to the write), direct import of cache helpers is the right pattern. This is documented as a deliberate divergence from the spec wording, with full rationale.
+
+**4. `create_order` does not pre-populate `order:status:{id}` cache on creation.**
+A new order is created with status PENDING. The cache for that order ID is empty at creation time. On first poll, the caller gets a cache miss, hits Postgres, reads PENDING, and re-caches it. By the time the customer polls (probably within seconds of creation), this adds one extra Postgres round-trip — but only once. The alternative is to call `set_cached_order_status(order_id, "PENDING")` at the end of `create_order`. This is a minor optimization decision. I left it without pre-caching because: (a) the order creation path already does significant work (meal validation, flush, commit, Celery dispatch, reload), and (b) the first poll is genuinely cheap (no items join in `get_order_status`). This can be revisited in Commit 09 if Celery task timing makes the pre-cache worthwhile.
+
+### Issues Found Mid-Task
+
+**TTL bug in `set_cached_order_status`.**
+Found immediately on reading `cache.py`. The function called `settings.cache_ttl_seconds` instead of a fixed 60. This would have caused the order status cache to behave identically to the menu cache — 300s TTL — which violates both the spec and the design intent. Fixed in this commit.
+
+**`get_cached_order_status` was never called anywhere.**
+The read path was implemented in `cache.py` but never imported or called. `order_service.py` imported only `invalidate_order_status_cache` and `set_cached_order_status`. The cache was write-only for order status — data went in but was never read back. Fixed by adding `get_order_status` which calls `get_cached_order_status` as its first action.
+
+### Self-Review Checklist
+
+- [x] `cache.py` — `set_cached_order_status` uses fixed 60s TTL, not `CACHE_TTL_SECONDS`
+- [x] `cache.py` — `set_cached_menu` still uses `settings.cache_ttl_seconds` (correct — menu uses the configurable TTL)
+- [x] `cache.py` — `get_settings` import still valid (used in `set_cached_menu`)
+- [x] `cache.py` — all six helpers have non-fatal try/except; Redis failures fall through
+- [x] `order_service.py` — `get_cached_order_status` now imported and used in `get_order_status`
+- [x] `order_service.py` — `get_order_status` returns `str | None` (not `OrderRead` — lightweight path)
+- [x] `order_service.py` — `get_order_status` cache miss falls through to `select(Order.status)` (no items join)
+- [x] `order_service.py` — `get_order_status` re-caches on miss so next poll within 60s is served from Redis
+- [x] `order_service.py` — `status_enum` typed as `OrderStatus | None` (no `Any`)
+- [x] `order_service.py` — `update_order_status` still invalidates + re-caches after every status transition (unchanged)
+- [x] `meal_service.py` — `list_meals` still serves from `menu:all` cache on hit; falls through to Postgres on miss
+- [x] `meal_service.py` — `create_meal` still invalidates `menu:all` after commit
+- [x] `ingredient_service.py` — `update_stock` invalidates `menu:all` after commit (verified in prior session)
+- [x] No `Any` in type hints across all changed files
+- [x] No raw SQL — all queries through `select()` and SQLAlchemy ORM
+- [x] No FastAPI imports in service files
+
+### Testing Criteria Assessment
+
+- **Second call to `GET /meals` is served from cache** — `list_meals` checks `get_cached_menu()` first; on the first call the cache is cold and Postgres is queried, then `set_cached_menu` fires. Second call hits the `if cached is not None` branch. Satisfiable by checking Redis `KEYS menu:all` after the first request.
+- **Cache is invalidated after `POST /meals`** — `create_meal` calls `invalidate_menu_cache()` after commit. Satisfiable by verifying `KEYS menu:all` returns empty after a create.
+- **Cache miss falls through to Postgres correctly** — the `try/except` on `json.loads` in `list_meals` and the `get_cached_menu` catch both cover this. A cold Redis or a corrupted key both fall through to Postgres.
+- **Order status cache reflects Celery updates within TTL** — `update_order_status` calls `set_cached_order_status` with the new status after every transition. The 60s TTL means the cache is accurate within 60s of any transition. `get_order_status` reads this cache on the next poll. Satisfiable once Commit 09 (Celery worker) is in place.
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `order:status:{id} TTL fixed at 60s, not CACHE_TTL_SECONDS` — order status changes on every Celery transition; a 300s TTL would serve stale status to polling customers; menu and order status have fundamentally different read/write frequency profiles so they require different TTLs
+- `get_order_status as dedicated lightweight status-poll function` — separating status-only polling from full order retrieval (`get_order`) avoids loading items+meals on every status check; Nova's agent polls status frequently during the kitchen simulation
+- `Depends injection not used for cache helpers in service layer` — `Depends` is a FastAPI mechanism valid in route handlers only; service functions are pure Python called from routes, Celery tasks, and tests; forcing FastAPI Depends into services would break Celery task callers and test fixtures; direct import of cache helpers is the correct pattern
+
+**ARCHITECTURE.md:**
+- Updated component: `src/core/cache.py` — `order:status:{id}` TTL corrected to fixed 60s; `get_cached_order_status` read path now wired into `get_order_status`
+- Updated component: `src/services/order_service.py` — added `get_order_status(db, order_id) -> str | None`; this is the cache-read path for lightweight status polling; imports `get_cached_order_status` from `cache.py`
+
+---
+
+## Handoff → Nova (updated after Commit 08)
+
+**What changed:** New function added to `order_service.py`.
+
+**New function:**
+- `get_order_status(db: AsyncSession, order_id: int) -> str | None`
+  - Returns the order status as a plain string ("PENDING", "PREPARING", "READY", "FAILED")
+  - Checks `order:status:{id}` Redis cache first (60s TTL)
+  - On cache miss: queries `select(Order.status)` from Postgres (no items join) and re-caches
+  - Returns `None` if the order ID does not exist
+
+**When to use it vs `get_order`:**
+- Use `get_order_status` when Nova's agent only needs to know whether an order is ready (status polling during the kitchen simulation). It is significantly cheaper — one Redis get or a single-column Postgres query vs. a full order + items + meals join.
+- Use `get_order` when the full order details are needed (customer summary, order confirmation display).
+
+**Files to read:**
+- `src/services/order_service.py` — new `get_order_status` function
+- `src/core/cache.py` — `get_cached_order_status` / `set_cached_order_status` (60s TTL)
+
+No route shape changes. No new error cases.
