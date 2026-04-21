@@ -223,6 +223,22 @@ It does not survive being reconstructed later.
 - GLOSSARY.md: [new term and definition]
 ```
 
+**Pre-building rule — mandatory for all agents:**
+
+If you build something during a step that belongs to a *future* protocol commit, you must log it immediately:
+
+```
+⏭️ SCOPE OVERFLOW → Commit [N] — [commit name]
+
+What I built early: [exactly what was implemented]
+Why I built it now: [the dependency or reason that made it necessary]
+What Commit [N] still needs to do: [what remains — or "nothing, fully pre-built"]
+```
+
+Write this in your current session's worklog and flag it to Claude. Claude tracks it so that when Commit N arrives, its scope is known in advance — not discovered at audit time. Building ahead silently leaves the scheduled commit agent confused about what remains.
+
+This rule applies to all agents. No exceptions.
+
 ---
 
 ## Inter-Agent Communication

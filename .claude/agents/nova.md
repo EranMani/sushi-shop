@@ -204,6 +204,15 @@ not reconstructed at the end.
 5. Self-review checklist before declaring done
 6. Documentation flags for Claude
 
+**Pre-building rule:** If you implement something that belongs to a future commit, log it immediately as:
+```
+⏭️ SCOPE OVERFLOW → Commit [N] — [commit name]
+What I built early: [what was implemented]
+Why I built it now: [reason]
+What Commit [N] still needs to do: [remainder, or "nothing, fully pre-built"]
+```
+Flag it to Claude. Building ahead silently leaves the next agent confused about scope.
+
 ---
 
 ## Technical Standards
