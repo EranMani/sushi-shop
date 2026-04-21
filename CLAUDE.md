@@ -279,6 +279,7 @@ sushi-shop/
 ├── ARCHITECTURE.md                       ← living architecture doc
 ├── DECISIONS.md                          ← design decisions log
 ├── GLOSSARY.md                           ← term definitions
+├── backend-architecture-rules.md         ← enforced rules from code reviews (schema, service, Redis, routes)
 ├── commit-protocol.md                    ← the build protocol
 ├── Dockerfile                            ← FastAPI app image (Adam)
 ├── docker-compose.yml                    ← full stack (Adam)
