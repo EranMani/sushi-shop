@@ -80,7 +80,8 @@ Redis caching, Postgres FTS, FastAPI routes, Celery architecture, and the full r
 25. **`scalar_one_or_none()` vs `scalar_one()`:**
     - `scalar_one_or_none()` — unwraps into an ORM object, returns `None` if no row matched. Use when not-found is a valid, expected outcome.
     - `scalar_one()` — raises `NoResultFound` if nothing matched. Use when the row must exist and its absence is a programming error.
-26. List comprehension is the clean pattern for bulk schema conversion:
+26. **Single-column queries for lightweight polling.** When only one column is needed, query that column directly — do not load the full ORM object with its relationships. `select(Order.status).where(Order.id == order_id)` returns the status enum value with no joins. The full `selectinload(Order.items).selectinload(OrderItem.meal)` chain is only justified when the caller actually needs the items and meal names. Nova's agent polls order status frequently — loading the full order on every poll is wasteful. Separate "status poll" (`get_order_status`) from "full order fetch" (`get_order`) explicitly.
+26a. List comprehension is the clean pattern for bulk schema conversion:
     `[_build_order_read(order) for order in orders]` — applies the same helper to every item, no duplication, no loop with appends.
 
 ---
@@ -119,6 +120,7 @@ Four conditions that justify caching a value in Redis:
 
 34. Always write to Postgres first. Redis is never the primary write target.
 35. Every key must have a TTL — use `setex`, not `set`. A key without a TTL is a memory leak.
+35a. **Different keys warrant different TTLs based on write frequency.** A single configurable `CACHE_TTL_SECONDS` is not always the right TTL for every key. `menu:all` uses `CACHE_TTL_SECONDS` (default 300s) because meals change rarely. `order:status:{id}` uses a fixed 60s because status changes on every Celery transition — a 300s TTL would serve stale status to a customer whose order reached READY 4 minutes ago. Match the TTL to the write frequency of the data, not to a global default.
 36. Every cache operation must be wrapped in `try/except` — Redis failure logs a warning, never crashes the app. Postgres is the source of truth; Redis is advisory.
 37. Invalidate on write, rebuild lazily on next read (cache-aside pattern) — don't rebuild eagerly.
 38. Cache the final serialised output — not the query, not the ORM object. Ready to serve on a cache hit.
