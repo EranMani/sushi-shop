@@ -5,6 +5,7 @@
 | # | Commit | Status | Key Decision |
 |---|--------|--------|--------------|
 | 01 | `database-models` | ✅ Done | `ARRAY(String)` for tags, named `orderstatus` enum, `expire_on_commit=False`, `os.environ` for DATABASE_URL (settings.py deferred to Commit 05) |
+| 06 | `order-service-routes` | ✅ Done | State machine enforced in `_VALID_TRANSITIONS` dict; `update_order_status` re-fetches with `selectinload` after commit (not `db.refresh`) because refresh does not re-apply eager-load chains in async context |
 | 02 | `alembic-initial-migration` | ✅ Done | Hand-written migration (no autogenerate); `orderstatus` enum created as standalone Postgres type with `create_type=False` + explicit `.create()` / `.drop()` to survive table drops |
 | 03 | `pydantic-schemas` | ✅ Done | `OrderStatus` imported from ORM model (single source of truth, no drift risk); `OrderItemRead` carries optional `meal_name` + `price_each` for agent readability; `IngredientStockUpdate` is absolute replacement (not delta) — documented in field description |
 | 04 | `core-dependencies` | ✅ Done | `get_settings()` cached with `lru_cache(maxsize=1)`; `database_url_must_use_asyncpg` validator catches wrong driver at startup not at engine creation; `deps.py` is a thin re-export to break circular imports in routes |
@@ -507,3 +508,148 @@ Ingredient lists are admin-facing (staff checking stock levels, not menu browsin
 - `src/core/database.py` — for `async_session_factory`
 
 I'm done with services and routes. Nova can read these files when her commits start.
+
+---
+
+---
+
+## Session 06 — Commit 07: `order-service-routes`
+
+**Date:** 2026-04-21
+**Task:** Build `order_service.py`, `src/api/routes/orders.py`, `src/core/celery_app.py`, and `src/tasks/kitchen.py` (stub). Wire orders router into `src/main.py`.
+
+### Task Brief
+
+The order service is the most structurally sensitive component so far. Three things make it harder than the meal/ingredient services:
+
+1. The state machine must be enforced — no invalid transitions, ever. The error messages must name the current state, the attempted state, and what is actually valid.
+2. Eager loading is mandatory and non-trivial — `OrderItemRead.meal_name` and `price_each` are populated from `OrderItem.meal`, which means every query that builds an `OrderRead` must `selectinload(Order.items).selectinload(OrderItem.meal)`.
+3. The Celery import chain must not break even though `process_order` is a stub — `celery_app.py` must exist and be fully configured so the import resolves cleanly.
+
+Files to produce:
+- `src/core/celery_app.py` — Celery app configuration (Redis broker/backend, queue routing, `task_acks_late=True`)
+- `src/tasks/__init__.py` — empty package marker
+- `src/tasks/kitchen.py` — stub `process_order` task (implemented in Commit 09)
+- `src/services/order_service.py` — `create_order`, `get_order`, `list_orders`, `update_order_status`
+- `src/api/routes/orders.py` — `POST /orders`, `GET /orders`, `GET /orders/{order_id}`
+- `src/main.py` — orders router included
+
+### Decisions Made
+
+**1. State machine enforced via `_VALID_TRANSITIONS` dict, not a series of if/elif.**
+A `dict[OrderStatus, set[OrderStatus]]` maps every state to its allowed target states. This makes the valid transitions readable in one place and makes adding/removing a transition a single-line change. The alternative (a chained if/elif in `update_order_status`) buries the business rule in control flow.
+
+**2. `update_order_status` re-fetches with `selectinload` after commit — does not use `db.refresh()`.**
+`db.refresh(order)` refreshes scalar columns but does not re-apply `selectinload` chains that were specified in the original query. In async SQLAlchemy, accessing unloaded relationships after a refresh would trigger lazy I/O, which is not permitted. The correct pattern is a fresh `select(...).options(selectinload(...))` after commit. This is explicitly documented in the code.
+
+**3. `create_order` uses `db.flush()` before creating `OrderItem` rows — not a second `db.add(order)` with `await db.commit()`.**
+The `Order` must have its auto-generated `id` before `OrderItem` rows can reference it. `flush()` writes the `Order` to the DB within the current transaction (getting the id back) without committing. The `OrderItem` rows are then added and the whole thing is committed in one transaction. Two commits would leave a window where an `Order` exists with no items — a corrupt state.
+
+**4. `process_order.delay()` is called after `await db.commit()` — not before.**
+If called before commit, the Celery worker might pick up the task and look up the order in Postgres before the order row is visible (the commit hasn't happened yet). This is a classic distributed systems race condition. Calling after commit ensures the worker always finds the order.
+
+**5. `_build_order_read` is a private helper — not a service function.**
+The logic for constructing `OrderRead` from an ORM object is used in all four service functions (`create_order`, `get_order`, `list_orders`, `update_order_status`). Factoring it out prevents drift and keeps each function focused on its single concern. It is private (`_build_order_read`) because it is an implementation detail — callers use the public service functions.
+
+**6. `Decimal(str(item.meal.price))` for price conversion.**
+`Meal.price` is declared as `Numeric(8,2)` in the ORM, but the Python type hint is `float` because SQLAlchemy's asyncpg driver may return floats for `Numeric` columns depending on configuration. Converting via `str()` first before `Decimal()` prevents floating-point precision errors that would occur with `Decimal(float_value)` directly.
+
+**7. `list_orders` is not cached — always reads from Postgres.**
+Order status changes frequently (every Celery task transition writes to Postgres). A cached order list would serve stale status values to Nova's tools within the TTL window. The customer-facing impact is significant — seeing PENDING when the order is READY. The menu (`menu:all`) is worth caching because it changes rarely; order state is not.
+
+**8. `celery_app.py` uses `task_acks_late=True` and `task_reject_on_worker_lost=True`.**
+These two settings together ensure tasks are never silently lost if a worker crashes. `task_acks_late` means the broker does not mark the task as delivered until the worker confirms completion. `task_reject_on_worker_lost` means the task is explicitly rejected (and requeued) if the worker process dies. Both are required for the kitchen simulation to be reliable under any worker failure mode.
+
+**9. `POST /orders` status-update route intentionally absent.**
+`update_order_status` is called only by the Celery kitchen worker. Exposing a route for it would allow the agent or a customer to set an order to any status — bypassing the state machine. The only status-modifying surface is the Celery task, which goes through `update_order_status` which enforces the transition table.
+
+### Issues Found Mid-Task
+
+**`src/tasks/` directory did not exist on disk.**
+The file structure in `CLAUDE.md` shows `src/tasks/kitchen.py` but the directory was absent. Created `src/tasks/__init__.py` via bash `touch` then wrote the stub. No cross-agent coordination needed — this is within my domain.
+
+**`db.refresh()` after commit does not restore `selectinload` chains.**
+Caught this during mental dry-run before writing the code. `refresh()` only refreshes the columns on the mapped instance — it does not re-run the eager-load strategy specified in the original `select()`. In async context, accessing `order.items` after `refresh()` without re-loading would raise `MissingGreenlet`. Fixed by dropping `refresh()` from `update_order_status` and using a full re-execute with `selectinload`.
+
+### Self-Review Checklist
+
+- [x] `celery_app.py` — `task_acks_late=True`, `task_reject_on_worker_lost=True`
+- [x] `celery_app.py` — two queues defined: `kitchen.orders` (primary) + `kitchen.dlq`
+- [x] `celery_app.py` — `include=["src.tasks.kitchen"]` so the stub task is registered
+- [x] `celery_app.py` — reads `REDIS_URL` via `get_settings()`, not `os.environ`
+- [x] `kitchen.py` — stub `process_order` imports from `src.core.celery_app`; decorated with `@celery_app.task(name="kitchen.process_order")`
+- [x] `order_service.py` — `create_order` validates all meal IDs exist and are available before creating any DB row
+- [x] `order_service.py` — `db.flush()` used to get `order.id` before adding `OrderItem` rows; single commit
+- [x] `order_service.py` — `process_order.delay(order.id)` called after `await db.commit()`
+- [x] `order_service.py` — full re-execute with `selectinload` after create to build response (not `db.refresh`)
+- [x] `order_service.py` — `_VALID_TRANSITIONS` dict covers all four states; READY and FAILED map to empty sets (terminal)
+- [x] `order_service.py` — `update_order_status` raises `ValueError` with current status, attempted status, and valid options
+- [x] `order_service.py` — `update_order_status` calls `invalidate_order_status_cache` + `set_cached_order_status` after commit
+- [x] `order_service.py` — `update_order_status` re-fetches with `selectinload` after commit (no `db.refresh`)
+- [x] `order_service.py` — `_build_order_read` converts `item.meal.price` via `Decimal(str(...))` to avoid float precision errors
+- [x] `order_service.py` — `list_orders` not cached; always reads from Postgres
+- [x] `order_service.py` — no FastAPI imports
+- [x] `order_service.py` — no `Any` in type hints
+- [x] `orders.py` (route) — `ValueError` from service mapped to `HTTPException(422)` with service message as detail
+- [x] `orders.py` (route) — `GET /orders/{order_id}` returns 404 with specific message including the ID
+- [x] `orders.py` (route) — no status-update route exposed
+- [x] `main.py` — orders router included
+- [x] Syntax check passed on all five files
+
+### 📋 Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `State machine enforced via _VALID_TRANSITIONS dict` — single source of truth for valid transitions; dict approach preferred over if/elif chain; terminal states (READY, FAILED) map to empty sets so the same validation code handles them without special-casing
+- `process_order.delay() called after db.commit()` — race condition prevention; Celery worker must find the committed order in Postgres when it picks up the task; calling before commit creates a window where the worker executes before the row is visible
+- `update_order_status re-fetches with selectinload after commit` — db.refresh() does not restore eager-load chains in async SQLAlchemy; fresh execute required to build OrderRead response without triggering lazy I/O
+- `list_orders not cached` — order status changes on every Celery transition; stale cache would mislead Nova's tools about current order state; only the menu (infrequent writes) is worth caching
+
+**ARCHITECTURE.md:**
+- New component: `src/core/celery_app.py` — Celery app singleton; Redis as broker + backend; two queues (kitchen.orders, kitchen.dlq); `task_acks_late=True` for reliable delivery
+- New component: `src/tasks/kitchen.py` — kitchen worker stub; `process_order` task registered; full implementation in Commit 09
+- New component: `src/services/order_service.py` — `create_order`, `get_order`, `list_orders`, `update_order_status`; state machine enforced here
+- New component: `src/api/routes/orders.py` — `POST /orders`, `GET /orders`, `GET /orders/{id}`
+- Updated: `src/main.py` — orders router included
+
+---
+
+## Handoff → Nova
+
+**What I built:** Order service + routes
+
+**New service: `order_service.py`**
+
+Function signatures:
+- `create_order(db: AsyncSession, data: OrderCreate) -> OrderRead`
+- `get_order(db: AsyncSession, order_id: int) -> OrderRead | None`
+- `list_orders(db: AsyncSession) -> list[OrderRead]`
+- `update_order_status(db: AsyncSession, order_id: int, new_status: OrderStatus) -> OrderRead`
+
+**Routes:**
+- `POST /orders` — body: `OrderCreate`, response: `OrderRead`, status 201 on success, 422 on invalid/unavailable meal ID (detail contains the specific meal ID and reason)
+- `GET /orders` — response: `list[OrderRead]`, sorted newest first, always from Postgres
+- `GET /orders/{order_id}` — response: `OrderRead`, 404 if not found
+
+**Error cases:**
+- `create_order` raises `ValueError` if any meal ID does not exist: "Meal id={id} does not exist. Verify the meal ID against GET /meals before placing an order."
+- `create_order` raises `ValueError` if any meal is unavailable: "Meal id={id} ('{name}') is currently unavailable. It cannot be added to an order until staff marks it available again."
+- Route maps both `ValueError` cases to `HTTPException(422)` with the service message as `detail`.
+- `update_order_status` raises `ValueError` on invalid transitions: includes current state, attempted state, and valid options. Called only by the Celery worker — not exposed as a route.
+- `update_order_status` raises `ValueError` if the order ID does not exist.
+
+**What Nova needs to know for her tools:**
+- Call `create_order(db, OrderCreate(customer_name=..., items=[...]))` to place an order. The service enqueues the kitchen task automatically — Nova does not call `process_order.delay()` herself.
+- All meal IDs in `OrderCreate.items` must resolve to meals where `is_available=True`. Use `get_meal(db, id)` or `search_meals(db, query)` to validate before placing the order — this avoids a 422 from `create_order`.
+- `OrderRead.items` is always populated with `meal_name` and `price_each` (from the eagerly-loaded `OrderItem.meal`). Nova's tools can display readable order summaries without additional queries.
+- `OrderRead.total_price` is a `Decimal` computed by the service. It is `None` only if the order has no items (which cannot happen given `OrderCreate` validation).
+- `update_order_status` is internal to the kitchen worker. Nova does not call it — she calls `get_order` to poll status.
+
+**Files to read:**
+- `src/services/order_service.py`
+- `src/schemas/order.py`
+- `src/models/order.py` — for `OrderStatus` enum values
+- `src/api/routes/orders.py`
+- `src/core/celery_app.py` — if Nova needs to understand the task queue topology
+- `src/tasks/kitchen.py` — stub only; full implementation in Commit 09
+
+I'm done. Nova can start when her commits are due.

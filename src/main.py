@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from src.api.routes.ingredients import router as ingredients_router
 from src.api.routes.meals import router as meals_router
+from src.api.routes.orders import router as orders_router
 
 app = FastAPI(
     title="Sushi Shop",
@@ -15,6 +16,7 @@ app = FastAPI(
 
 app.include_router(meals_router)
 app.include_router(ingredients_router)
+app.include_router(orders_router)
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────

@@ -321,6 +321,7 @@ Business logic lives in `src/services/`. Services are pure Python — no FastAPI
 |---|---|
 | `src/services/meal_service.py` | `create_meal`, `get_meal`, `get_meal_by_name`, `list_meals` (Redis-cached), `search_meals` (Postgres FTS) |
 | `src/services/ingredient_service.py` | `create_ingredient`, `get_ingredient`, `list_ingredients`, `update_stock` |
+| `src/services/order_service.py` | `create_order`, `get_order`, `list_orders`, `update_order_status` |
 
 **FTS implementation:** `search_meals` builds a combined tsvector over both `name` and `tags`:
 ```sql
@@ -328,14 +329,20 @@ to_tsvector('english', name) || to_tsvector('english', array_to_string(tags, ' '
 ```
 This means a query for "spicy" matches meals named "Spicy Tuna" and meals tagged `["spicy"]`. Nova's `search_meals` agent tool calls this function directly.
 
+**Celery app (`src/core/celery_app.py`):**
+Redis is used as both broker and result backend. Two queues: `kitchen.orders` (primary) and `kitchen.dlq` (dead-letter). `task_acks_late=True` and `task_reject_on_worker_lost=True` prevent silent task loss under any worker failure mode. The kitchen task module (`src/tasks/kitchen.py`) is registered via `include=["src.tasks.kitchen"]`.
+
 **Cache strategy (`src/core/cache.py`):**
 - `menu:all` — full serialised meal list, TTL = `CACHE_TTL_SECONDS`. Invalidated on any Meal or Ingredient write.
 - `order:status:{id}` — current status string, TTL = 60s. Updated by the Celery kitchen worker.
 - All cache operations are non-fatal — Redis failure logs a warning and falls through to Postgres.
 
+**`update_order_status` is called only by the Celery worker — never by the route layer.** No `PATCH /orders/{id}/status` route exists. Exposing status transitions to the public API would allow illegal state changes. The kitchen worker is the sole authority on order status progression.
+
 **Route surface:**
 - `POST /meals`, `GET /meals`, `GET /meals/search?q=`, `GET /meals/{id}`
 - `POST /ingredients`, `GET /ingredients`, `GET /ingredients/{id}`, `PATCH /ingredients/{id}/stock`
+- `POST /orders` (201 + `OrderRead`), `GET /orders`, `GET /orders/{id}` (404 on miss)
 
 ---
 

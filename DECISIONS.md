@@ -245,6 +245,60 @@ Each entry:
 
 ---
 
+## Commit 07 — order-service-routes
+
+---
+
+### D-18 · `db.flush()` before `OrderItem` creation in `create_order`
+
+**What:** After inserting the `Order` row, `await db.flush()` is called before creating `OrderItem` rows — rather than committing immediately or relying on the ORM to resolve the FK.
+
+**Why:** `flush()` sends the `INSERT Order` to Postgres within the current transaction and populates `order.id` from the database-generated primary key, without committing. The `OrderItem` rows need `order.id` as a foreign key. Without `flush()`, `order.id` is `None` at ORM level and the insert would fail. `flush()` keeps everything in one transaction — if any `OrderItem` insert fails, the whole order rolls back cleanly.
+
+**Raised by:** Rex (Commit 07)
+
+---
+
+### D-19 · `process_order.delay()` called after `db.commit()`, not before
+
+**What:** The Celery kitchen task is enqueued *after* the transaction commits, not inside it.
+
+**Why:** If the task is enqueued before commit and the Celery worker picks it up immediately, it queries Postgres for the order and finds nothing — the row isn't committed yet. Enqueueing after commit guarantees the worker always finds the order in Postgres. The tradeoff: if Celery enqueue fails after a successful commit, the order sits in PENDING state with no worker assigned. This is recoverable — a manual requeue or worker restart can pick it up. A failed commit after successful enqueue would be far worse (task runs, no order exists).
+
+**Raised by:** Rex (Commit 07)
+
+---
+
+### D-20 · `_VALID_TRANSITIONS` dict — terminal states map to `set()`
+
+**What:** The state machine is encoded as `dict[OrderStatus, set[OrderStatus]]` where `READY` and `FAILED` map to empty sets rather than being excluded from the dict.
+
+**Why:** A missing key would require a separate `if current_status not in _VALID_TRANSITIONS` guard before the transition lookup. Mapping terminal states to `set()` means the same lookup path handles all states — the empty set check is the terminal state signal, no special-casing needed. The error message branches on whether `allowed_targets` is empty to produce the correct message ("terminal state" vs "valid transitions are: X").
+
+**Raised by:** Rex (Commit 07)
+
+---
+
+### D-21 · `update_order_status` re-fetches with `selectinload` instead of `db.refresh()`
+
+**What:** After committing the status update, the function re-executes a `select` with `selectinload` rather than calling `await db.refresh(order)`.
+
+**Why:** `db.refresh()` reloads scalar columns from the database but does not re-apply `selectinload` chains. In async SQLAlchemy, accessing relationship attributes that were not eagerly loaded raises `MissingGreenlet` — lazy loading is not permitted in async context. A fresh `select` with explicit `selectinload(Order.items).selectinload(OrderItem.meal)` guarantees the full object graph is present for `_build_order_read`.
+
+**Raised by:** Rex (Commit 07)
+
+---
+
+### D-22 · No `PATCH /orders/{id}/status` route exposed
+
+**What:** There is no public HTTP endpoint for updating order status. `update_order_status` is called only by the Celery kitchen worker.
+
+**Why:** Exposing a status-update endpoint would allow any caller (including Nova's agent or a malicious client) to drive the order into any state — bypassing the state machine entirely. The kitchen worker is the only legitimate authority for status transitions. Keeping the transition function internal-only enforces this by design, not by access control.
+
+**Raised by:** Rex (Commit 07)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.
