@@ -330,10 +330,24 @@ to_tsvector('english', name) || to_tsvector('english', array_to_string(tags, ' '
 This means a query for "spicy" matches meals named "Spicy Tuna" and meals tagged `["spicy"]`. Nova's `search_meals` agent tool calls this function directly.
 
 **Celery app (`src/core/celery_app.py`):**
-Redis is used as both broker and result backend. Two queues: `kitchen.orders` (primary) and `kitchen.dlq` (dead-letter). `task_acks_late=True` and `task_reject_on_worker_lost=True` prevent silent task loss under any worker failure mode. The kitchen task module (`src/tasks/kitchen.py`) is registered via `include=["src.tasks.kitchen"]`.
+Redis is used as both broker and result backend. Two queues: `kitchen.orders` (primary) and `kitchen.dlq` (dead-letter). `task_acks_late=True` and `task_reject_on_worker_lost=True` prevent silent task loss under any worker failure mode. `task_routes={"kitchen.order_failed": {"queue": "kitchen.dlq"}}` ensures the tombstone task is always routed to the DLQ queue regardless of call site. The kitchen task module (`src/tasks/kitchen.py`) is registered via `include=["src.tasks.kitchen"]`.
 
 **Kitchen worker (`src/tasks/kitchen.py`):**
-`process_order` is a sync Celery task (`bind=True`, `max_retries=1`, `default_retry_delay=10s`) that bridges into async via a single `asyncio.run(_async_process_order(order_id))` call. The full async body runs in one event loop with one `AsyncSession` for its lifetime — two status transitions, one session, one loop. The task is idempotent: current status is read before each transition and already-applied transitions are skipped, making it safe to retry after a partial execution. `KITCHEN_PREP_TIME_SECONDS` (default 5s, configurable via env var) controls the simulated prep delay between transitions. DLQ routing and FAILED status handling on exhausted retries belong to Commit 10.
+`process_order` is a sync Celery task (`base=KitchenTask`, `bind=True`, `max_retries=1`, `default_retry_delay=10s`) that bridges into async via a single `asyncio.run(_async_process_order(order_id))` call. The full async body runs in one event loop with one `AsyncSession` for its lifetime — two status transitions, one session, one loop. The task is idempotent: current status is read before each transition and already-applied transitions are skipped, making it safe to retry after a partial execution. `KITCHEN_PREP_TIME_SECONDS` (default 5s, configurable via env var) controls the simulated prep delay between transitions.
+
+**Full failure path (Commit 10):**
+```
+unhandled exception in process_order
+  → self.retry(exc=exc) — retry once after 10s
+  → retry also fails → Celery invokes KitchenTask.on_failure
+      → asyncio.run(_async_set_order_failed(order_id)) — sets FAILED in Postgres
+      → celery_app.send_task("kitchen.order_failed", ..., queue="kitchen.dlq") — tombstone
+          → order_failed task logs permanently failed order on kitchen.dlq
+```
+
+`KitchenTask` is a `celery.Task` subclass registered via `base=KitchenTask` on `process_order`. This is the official Celery mechanism for attaching `on_failure` to a function-based task. `on_failure` must not call `self.retry()` and must not re-raise — it fires after all retries are exhausted. The Postgres write and the DLQ tombstone dispatch are wrapped in independent `try/except` blocks: a DB failure does not prevent the tombstone, and a broker failure does not prevent the FAILED status write.
+
+`order_failed` is a tombstone task — pure audit record, no side effects. Order status is already `FAILED` before the tombstone fires.
 
 **Cache strategy (`src/core/cache.py`):**
 - `menu:all` — full serialised meal list, TTL = `CACHE_TTL_SECONDS`. Invalidated on any Meal or Ingredient write.
@@ -430,4 +444,5 @@ OPENAI_API_KEY=<key>
 # App
 APP_ENV=development             # development | production
 CACHE_TTL_SECONDS=300
+KITCHEN_PREP_TIME_SECONDS=5    # simulated kitchen delay; set to 1-2 in CI for fast cycles
 ```

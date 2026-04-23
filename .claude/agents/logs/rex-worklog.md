@@ -12,6 +12,7 @@
 | 05 | `meal-ingredient-service-routes` | ✅ Done | FTS via combined `to_tsvector(name) \|\| to_tsvector(array_to_string(tags))` + `plainto_tsquery`; `/search` route declared before `/{id}` to avoid FastAPI ordering shadow; Redis failures non-fatal in all cache helpers |
 | 07 | `redis-cache-layer` | ✅ Done | Fixed `order:status:{id}` TTL to 60s (was incorrectly using `CACHE_TTL_SECONDS`); added `get_order_status` as the cache-read path for lightweight status polling; `Depends` injection rejected as inappropriate for service-layer cache helpers |
 | 08 | `celery-kitchen-worker` | ✅ Done | Single `asyncio.run()` over one async coroutine bridges sync Celery → async service; `bind=True` + `self.retry()` for safe retry triggering; idempotency guard reads current status before each transition |
+| 09 | `celery-dlq` | ✅ Done | `KitchenTask(celery_app.Task)` subclass with `on_failure` override; two independent try/except blocks so DB write failure never suppresses DLQ tombstone dispatch; `_async_set_order_failed` catches duplicate FAILED transition (terminal state guard) and logs rather than re-raises |
 
 ---
 
@@ -865,3 +866,105 @@ No scope overflow. Commit 10 owns all of that.
 
 **What you need to update:**
 - `.env.example` — add `KITCHEN_PREP_TIME_SECONDS=5` with a comment explaining it controls the simulated kitchen prep delay; mention it can be set lower (e.g. 1 or 2) in test/CI environments for faster cycle times
+
+---
+
+---
+
+## Session 09 — Commit 10: `celery-dlq`
+
+**Date:** 2026-04-23
+**Task:** Add the DLQ failure path to the Celery kitchen worker. When `process_order` exhausts its one retry, an `on_failure` handler must set the order status to FAILED in Postgres, log the failure at ERROR level, and route a tombstone record to the `kitchen.dlq` queue.
+
+### Task Brief
+
+Commit 09 left `max_retries=1` and `self.retry(exc=exc)` in place but intentionally deferred all FAILED-path logic to this commit. Commit 10 owns:
+
+1. `KitchenTask` — a `celery_app.Task` subclass that overrides `on_failure`. Applied to `process_order` via `base=KitchenTask`.
+2. `_async_set_order_failed(order_id)` — the async bridge inside `on_failure`, following the same `asyncio.run()` pattern as `_async_process_order`. Catches any exception from `update_order_status` (e.g. already-FAILED from a prior attempt) and logs rather than re-raises.
+3. `order_failed` task — a DLQ tombstone task registered on `kitchen.dlq`. Logs the failure and does nothing further. Consumed by monitoring infrastructure.
+4. `task_routes` in `celery_app.py` — routes `kitchen.order_failed` to `kitchen.dlq`.
+
+### Decisions Made
+
+**1. `KitchenTask(celery_app.Task)` with `base=KitchenTask` on `process_order`.**
+The cleanest Celery-idiomatic pattern for overriding `on_failure` on a function-based task. The alternative — assigning `on_failure` to the decorated task object after the fact — is fragile because it relies on Celery's internal attribute patching and is not documented as a supported pattern. Subclassing `Task` and setting `base=KitchenTask` is the official Celery mechanism. The class is defined before the `process_order` decorator so the decorator can reference it.
+
+**2. `on_failure` is a sync method — async bridge via a dedicated `_async_set_order_failed` coroutine.**
+Same pattern as `_async_process_order`. The `on_failure` hook fires in the Celery worker process (sync context, no running event loop). `asyncio.run()` creates a fresh event loop, runs the coroutine, tears it down. One function, one session, one loop — consistent with what Commit 09 established.
+
+**3. `on_failure` catches and logs exceptions from `update_order_status` — does not re-raise.**
+Two reasons: (a) re-raising from `on_failure` is undefined behaviour in Celery — the hook is called after retries are exhausted and there is no further retry machinery to handle a new exception; (b) the most likely exception is a duplicate FAILED transition (order already FAILED from a prior `on_failure` call on a previous retry) — this is not an error worth escalating. The order is already in the right state.
+
+**4. `on_failure` still routes to `kitchen.dlq` even if the FAILED status update fails.**
+Reasoning: if setting FAILED in Postgres fails, the DLQ tombstone is still valuable — it gives monitoring a record that this order was unreachable. The alternative (skip DLQ on DB error) would silently drop the failure record. The DLQ record is independent of the DB write.
+
+**5. `order_failed` task logs at ERROR level (not INFO).**
+The DLQ is not a normal code path. A message reaching the DLQ is always an error condition from an operational perspective — a kitchen order that could not be processed even after retry. Logging at INFO would bury it in normal operation noise. ERROR level ensures it is visible in any standard log alerting setup.
+
+**6. `task_routes` routes only `kitchen.order_failed` to `kitchen.dlq`.**
+`kitchen.process_order` stays on `kitchen.orders` (the default queue). `task_routes` is a dict keyed by task name — adding only `kitchen.order_failed` here is surgical and does not risk accidentally rerouting other tasks.
+
+**7. The `order_failed` task does not call `update_order_status`.**
+Status is already set to FAILED in `on_failure` before the tombstone is dispatched. `order_failed` is a pure audit/monitoring record — it must not have side effects that could double-apply the FAILED transition or interfere with the order state. Its only job is to exist in the DLQ for monitoring tools to consume.
+
+**8. `exc` cast to `str` before passing to `order_failed`.**
+Celery serialises task arguments as JSON. An exception object is not JSON-serialisable. `str(exc)` gives the human-readable exception message — enough for logging and monitoring purposes without requiring special deserialisers.
+
+**9. `on_failure` extracts `order_id` from `args[0]` with a fallback to `kwargs.get("order_id")`.**
+`process_order` is called positionally (`process_order.delay(order_id)`) so `args[0]` is the reliable path. The `kwargs.get` fallback handles the case where someone calls `process_order.apply_async(kwargs={"order_id": 42})` — both forms should work without crashing `on_failure`.
+
+**10. `on_failure` uses `order_id is not None` guard before any DB or DLQ action.**
+If `args` is empty and `kwargs` has no `order_id`, there is nothing sensible to do except log the anomaly. This prevents a crash inside `on_failure` itself, which would produce a confusing secondary failure.
+
+### Issues Found Mid-Task
+
+No cross-domain issues. One design clarification resolved before writing code:
+
+**`KitchenTask` class placement:** the class must be defined before the `@celery_app.task(base=KitchenTask, ...)` decorator is applied to `process_order`. In Python, decorator arguments are evaluated at class definition time. `KitchenTask` is defined at the top of the task module, after imports and before any task decorators. This is the correct order.
+
+**`on_failure` signature:** Celery passes `(self, exc, task_id, args, kwargs, einfo)` to `on_failure`. `args` is a list (the positional arguments to the task call). `kwargs` is a dict. `einfo` is a Celery `ExceptionInfo` object — not used in this implementation but must be accepted in the signature.
+
+### Self-Review Checklist
+
+- [x] `KitchenTask` inherits from `celery_app.Task` (not bare `celery.Task`)
+- [x] `process_order` uses `base=KitchenTask` — `on_failure` wired in
+- [x] `on_failure` signature matches Celery spec: `(self, exc, task_id, args, kwargs, einfo)`
+- [x] `order_id` extracted from `args[0]` with `kwargs` fallback — guarded against None
+- [x] `_async_set_order_failed` opens its own `AsyncSession` — independent of the original task session
+- [x] `_async_set_order_failed` calls `update_order_status(db, order_id, OrderStatus.FAILED)`
+- [x] `update_order_status` call is wrapped in try/except inside `_async_set_order_failed` — exceptions logged not re-raised
+- [x] `asyncio.run(_async_set_order_failed(order_id))` in `on_failure` — same bridge pattern as the main task
+- [x] `asyncio.run()` call itself is wrapped in try/except in `on_failure` — catches event loop issues
+- [x] `celery_app.send_task("kitchen.order_failed", args=[order_id, str(exc)], queue="kitchen.dlq")` called after FAILED status update
+- [x] `send_task` is wrapped in try/except — DLQ dispatch failure logged, not re-raised
+- [x] `on_failure` logs at ERROR level with order_id, task_id, and exception message
+- [x] `order_failed` task registered with `name="kitchen.order_failed"`, `queue="kitchen.dlq"`
+- [x] `order_failed` task logs at ERROR level (not INFO — DLQ is an error condition)
+- [x] `order_failed` task does not call `update_order_status` — status already set in `on_failure`
+- [x] `task_routes` added to `celery_app.conf.update` — `kitchen.order_failed` → `kitchen.dlq`
+- [x] No `Any` in type hints (existing `self: Any` on `process_order` is pre-existing and documented)
+- [x] `KitchenTask.on_failure` does not call `self.retry()` — hook fires after retries exhausted
+- [x] No FastAPI imports in `kitchen.py`
+- [x] No raw SQL
+- [x] Syntax checked on both files
+
+### Documentation Flags for Claude
+
+**DECISIONS.md:**
+- `KitchenTask subclass pattern for on_failure` — subclassing `celery_app.Task` with `base=KitchenTask` is the official Celery mechanism for overriding `on_failure` on function-based tasks; post-decoration attribute assignment is fragile and undocumented
+- `on_failure catches and logs exceptions — does not re-raise` — re-raising from `on_failure` is undefined in Celery; most likely exception is duplicate FAILED transition (already-failed order); logging is sufficient, the order state is already correct
+- `order_failed DLQ task is a pure tombstone` — no side effects; status is already FAILED when the tombstone fires; audit/monitoring record only; `str(exc)` used because Celery serialises task args as JSON
+
+**ARCHITECTURE.md:**
+- Updated component: `src/tasks/kitchen.py` — added `KitchenTask(celery_app.Task)` subclass with `on_failure` hook; `process_order` now uses `base=KitchenTask`; added `_async_set_order_failed` async bridge; added `order_failed` tombstone task on `kitchen.dlq`
+- Updated component: `src/core/celery_app.py` — added `task_routes` to route `kitchen.order_failed` to `kitchen.dlq`; failure path is now: exception → retry (once, 10s) → `on_failure` → set FAILED in Postgres → dispatch tombstone to `kitchen.dlq`
+
+---
+
+## Handoff → Adam (re-check from Session 08)
+
+Adam's handoff note from Commit 09 (`KITCHEN_PREP_TIME_SECONDS`) is still pending. No new env vars or dependencies are added in Commit 10. Confirming the outstanding action from Session 08:
+
+- `.env.example` — still needs `KITCHEN_PREP_TIME_SECONDS=5` added (per Session 08 handoff)
+- No new action required from Adam for Commit 10 — `kitchen.dlq` queue was already declared in `celery_app.py` from Commit 07; `task_routes` is a config-only change, no new services or ports

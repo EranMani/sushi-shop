@@ -75,6 +75,16 @@ celery_app.conf.update(
     # source of truth — order status is read from Postgres, not from Celery.
     result_expires=3600,
 
+    # ── Task routing ──────────────────────────────────────────────────────────
+    # kitchen.order_failed is the DLQ tombstone task. It is routed explicitly
+    # to kitchen.dlq so that monitoring tools can consume it separately from
+    # the primary kitchen.orders queue.
+    # kitchen.process_order uses the default queue (kitchen.orders) — no
+    # explicit routing entry needed.
+    task_routes={
+        "kitchen.order_failed": {"queue": "kitchen.dlq"},
+    },
+
     # ── Task autodiscovery ────────────────────────────────────────────────────
     # Register the kitchen task module so Celery can find process_order.
     include=["src.tasks.kitchen"],

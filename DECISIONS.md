@@ -377,6 +377,40 @@ Each entry:
 
 ---
 
+## Commit 10 — celery-dlq
+
+---
+
+### D-30 · `KitchenTask` subclass for `on_failure` — not post-decoration attribute patching
+
+**What:** `on_failure` is implemented by subclassing `celery.Task` as `KitchenTask` and using `base=KitchenTask` on the `process_order` decorator. Post-decoration attribute assignment (`process_order.on_failure = some_fn`) was explicitly rejected.
+
+**Why:** Post-decoration attribute patching is undocumented in Celery and relies on internal attribute resolution. Subclassing is the documented mechanism — it is explicit, readable, and stable across Celery versions. `on_failure` fires after retries are exhausted, must not call `self.retry()`, and must not re-raise.
+
+**Raised by:** Rex (Commit 10)
+
+---
+
+### D-31 · Two independent `try/except` blocks in `KitchenTask.on_failure`
+
+**What:** The Postgres FAILED status write and the DLQ tombstone dispatch are each wrapped in their own `try/except` block — not combined in one.
+
+**Why:** These two operations have different failure modes. A DB failure (Postgres unavailable) must not prevent the tombstone from being dispatched to the DLQ — monitoring needs a record even when the database is down. A broker failure (Redis unavailable) must not suppress the FAILED status write. Combining them in one `try` would silently drop the second operation if the first raised.
+
+**Raised by:** Rex (Commit 10)
+
+---
+
+### D-32 · `order_failed` DLQ task is a pure tombstone — no side effects
+
+**What:** The `order_failed` task (routed to `kitchen.dlq`) only logs. It does not call `update_order_status`.
+
+**Why:** `on_failure` already sets the order to `FAILED` before dispatching the tombstone. If `order_failed` also called `update_order_status`, it would hit the terminal-state guard in `_VALID_TRANSITIONS` (FAILED → FAILED is not a valid transition) and raise. The tombstone's sole purpose is to create a durable, monitorable record in the DLQ queue. `str(exc)` is used for the error argument because Celery serialises task args as JSON and exception objects are not JSON-serialisable.
+
+**Raised by:** Rex (Commit 10)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.
