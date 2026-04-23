@@ -15,6 +15,14 @@ Each entry:
 
 ---
 
+## Commit 10 — celery-dlq
+
+**Concept:** Attaching `on_failure` to a Celery task via `base=` subclass
+
+**Why it matters here:** Celery function-based tasks support lifecycle hooks (`on_failure`, `on_retry`, `on_success`), but there is no direct argument to the `@task(on_failure=...)` decorator. The correct mechanism is to subclass `celery.Task`, override the hook method, and pass `base=MyTaskClass` to the decorator. In `kitchen.py`, `KitchenTask(Task)` overrides `on_failure` — which fires after all retries are exhausted — to set the order to `FAILED` and dispatch a DLQ tombstone. The non-obvious part: `on_failure` must **not** call `self.retry()` (retries are already exhausted) and must **not** re-raise exceptions (re-raising from `on_failure` is undefined behaviour in Celery and produces a secondary unhandled failure). The two operations inside `on_failure` (DB write + DLQ dispatch) are in separate `try/except` blocks so a DB outage doesn't prevent the monitoring record from reaching the DLQ.
+
+---
+
 ## Commit 09 — celery-kitchen-worker
 
 **Concept:** Bridging sync Celery tasks into async SQLAlchemy with `asyncio.run()`

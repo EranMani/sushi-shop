@@ -8,7 +8,11 @@
       "Bash(pip show *)",
       "Bash(python -)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import redis.asyncio as r; print\\('OK, from_url:', hasattr\\(r, 'from_url'\\)\\)\")",
+      "Bash(git commit *)",
+      "Bash(python *)"
     ]
   }
 }

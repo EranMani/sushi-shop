@@ -236,6 +236,32 @@ Four conditions that justify caching a value in Redis:
 
 ---
 
+## Celery Task Implementation Patterns
+
+79. **Celery tasks are sync; async business logic lives in a separate coroutine.** A Celery task function must be a plain `def` — not `async def`. The async work (DB access, cache writes, service calls) is factored into a dedicated `async def _async_<task_name>` coroutine. The task function calls `asyncio.run(_async_<task_name>(...))` once.
+
+80. **`asyncio.run()` does not need `await`.** It is a regular sync function that creates an event loop, blocks until the coroutine completes, then tears the loop down. `await` only appears inside `async def` functions — the task body is a plain `def`, so no `await` there.
+
+81. **One `asyncio.run()` call per task execution — not one per transition.** Running `asyncio.run()` twice (once per state transition) creates and destroys two event loops and two sessions. One coroutine, one loop, one session covers the full task lifetime: cheaper and avoids session lifecycle gaps between transitions.
+
+82. **Manual `async_session_factory()` in Celery tasks — never `get_db`.** `get_db` is a FastAPI dependency and only works in route handler context. Celery workers have no dependency injection framework. Open the session manually: `async with async_session_factory() as db:` inside the async coroutine.
+
+83. **`bind=True` is the standard decorator flag for retryable tasks.** It injects `self` (the Celery Task instance) as the first argument, giving access to `self.retry()`. Without `bind=True`, triggering a retry requires calling `task_name.retry()` — a module-level name reference that is fragile if the function is renamed or the module is restructured.
+
+84. **Retry sequence: one retry, 10-second delay, then DLQ.** On any unhandled exception: catch it, log elapsed time + error, call `raise self.retry(exc=exc)`. `self.retry()` re-queues the task with `default_retry_delay` seconds of backoff. After `max_retries` is exhausted, the exception propagates to the failure handler (DLQ routing + FAILED status).
+
+85. **Task acknowledgement and Redis message removal are driven by `task_acks_late=True`.** The broker does not remove a task message from the queue until the worker *acknowledges* it. With `acks_late`, acknowledgement happens only after the task function returns successfully — not on receipt. A worker crash mid-execution leaves the message unacknowledged; Redis requeues it automatically.
+
+86. **Idempotency guard: read current status before each transition, not once at the start.** Reading status once at the top only guards against retries that start clean. The real risk is a crash after the first transition completes — the order is PREPARING when the retry starts. The guard must detect this and skip the first transition, not abort the whole task. Check status before each transition independently.
+
+87. **The FAILED status falls into the `else` branch — treat it explicitly.** If an order is FAILED when the task runs, the code skips the PENDING → PREPARING transition (else branch) and proceeds to PREPARING → READY — which `update_order_status` rejects as an invalid transition, raises `ValueError`, triggers retry, and eventually hits the DLQ. FAILED is a terminal state; the failure handler (Commit 10) owns this path.
+
+88. **Naming convention: file name mirrors task name.** `src/tasks/kitchen.py` contains `process_order`. The Celery task name is `"kitchen.process_order"`. File → function → registered name follow a consistent dotted path — the same convention as Python's relative import structure. This makes task names predictable without reading the decorator.
+
+89. **Task function responsibility is strictly: timing, bridge, error handling.** The task function logs a start timestamp, calls `asyncio.run(...)`, catches exceptions to trigger retry, and logs elapsed time on completion or failure. No business logic belongs here — all of that lives in the async coroutine.
+
+---
+
 ## Full Request Flow — Client to Kitchen and Back
 
 ```
