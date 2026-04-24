@@ -360,6 +360,48 @@ unhandled exception in process_order
 - `POST /meals`, `GET /meals`, `GET /meals/search?q=`, `GET /meals/{id}`
 - `POST /ingredients`, `GET /ingredients`, `GET /ingredients/{id}`, `PATCH /ingredients/{id}/stock`
 - `POST /orders` (201 + `OrderRead`), `GET /orders`, `GET /orders/{id}` (404 on miss)
+- `POST /agent/chat` — Nova's route; accepts `{message, customer_name}`, returns `{reply, order_id}`
+
+---
+
+## Agent Layer
+
+The LangGraph AI assistant lives in `src/agents/`. All files are Nova's domain.
+
+**`src/agents/state.py`** — `AgentState(TypedDict)` with 6 fields:
+
+| Field | Type | Set by |
+|---|---|---|
+| `messages` | `list[BaseMessage]` | Every LLM-calling node (appends) |
+| `meals_found` | `list[MealResult]` | `search_meals_node` |
+| `availability` | `AvailabilityResult \| None` | `check_availability_node` |
+| `substitutes` | `list[MealResult]` | `find_substitutes_node` |
+| `order_id` | `int \| None` | `confirm_and_dispatch_node` on success |
+| `error` | `str \| None` | Any node that catches an exception |
+
+`make_initial_state(messages)` factory returns a properly zeroed state for graph invocation.
+
+**`src/agents/tools.py`** — Tool output schemas (`MealResult`, `AvailabilityResult`, `OrderResult`) and four `@tool`-decorated async functions. Commit 11 contains stubs; real service calls are wired in Commit 12 (`search_meals`, `check_ingredients`, `find_substitutes`) and Commit 13 (`dispatch_order`). `MealResult` is defined independently of `src/schemas/meal.MealRead` — the tool output contract is stable regardless of service schema changes.
+
+**`src/agents/graph.py`** — Full `StateGraph(AgentState)` with 7 async nodes and 4 deterministic conditional edges. Compiled at module load as `graph`. All routing decisions read state fields directly — no LLM calls in edge functions. `graph.ainvoke(state, config={"recursion_limit": 25})` is the mandatory invocation pattern.
+
+Node responsibilities:
+
+| Node | Type | State reads | State writes |
+|---|---|---|---|
+| `understand_request` | LLM | `messages` | `messages` |
+| `search_meals_node` | Tool | `messages` (last tool call) | `meals_found` |
+| `check_availability_node` | Tool | `meals_found[0].id` | `availability` |
+| `find_substitutes_node` | Tool | `meals_found[0].id` | `substitutes` |
+| `present_options_node` | LLM | `meals_found`, `substitutes`, `messages` | `messages` |
+| `confirm_and_dispatch_node` | LLM + Tool | `messages` | `order_id`, `messages` |
+| `apologise_node` | LLM (with hardcoded fallback) | `error`, `messages` | `messages` |
+
+**`src/agents/prompts/assistant.py`** — Five prompt constants: `ASSISTANT_SYSTEM_PROMPT`, `UNDERSTAND_REQUEST_PROMPT`, `PRESENT_OPTIONS_PROMPT`, `CONFIRM_AND_DISPATCH_PROMPT`, `APOLOGISE_PROMPT`. All structured as: role → task → constraints → output format → examples. Comments in the file explain why each constraint exists.
+
+**`src/agents/circuit_breaker.py`** — `LLMCircuitBreaker` wrapping `pybreaker.CircuitBreaker` (threshold=3 failures, cooldown=60s). Singleton `llm_circuit_breaker` exported. Scaffold only in Commit 11 — wired into graph nodes in Commit 14. When OPEN, raises `CircuitBreakerOpen` immediately so the node can set `state["error"]` and route to `apologise_node`.
+
+**`src/api/routes/agent.py`** — `POST /agent/chat` stub (`ChatRequest` → `ChatResponse`). Returns placeholder response in Commit 11; full `graph.ainvoke()` implementation in Commit 13.
 
 ---
 

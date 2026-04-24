@@ -411,6 +411,60 @@ Each entry:
 
 ---
 
+## Commit 11 — langgraph-agent-foundation
+
+---
+
+### D-33 · Graph nodes are `async def` — `graph.ainvoke()` is mandatory
+
+**What:** All seven LangGraph graph nodes are `async def` functions. The graph is invoked via `await graph.ainvoke(state, config={"recursion_limit": 25})`, not `graph.invoke()`.
+
+**Why:** FastAPI route handlers are async. If graph nodes were sync and called `asyncio.run()` internally to bridge async tool calls, `asyncio.run()` would raise `RuntimeError: This event loop is already running` — Python's asyncio does not allow nested event loops. Async nodes invoked via `graph.ainvoke()` run natively in the existing event loop, which is the correct pattern for async FastAPI routes. This decision locks in `graph.ainvoke()` in Commit 13's route handler.
+
+**Raised by:** Nova (Commit 11 — caught before writing code via cognitive architecture sketch)
+
+---
+
+### D-34 · `MealResult` is a standalone schema, independent of `MealRead`
+
+**What:** `src/agents/tools.py` defines its own `MealResult(BaseModel)` rather than importing or subclassing `MealRead` from `src/schemas/meal.py`.
+
+**Why:** Tool output schemas are the agent's API contract — they define what the LLM sees and reasons about. If `MealRead` changes (Rex adds fields, changes types), `MealResult` should remain stable. The two schemas have different audiences: `MealRead` is a REST API response contract; `MealResult` is an LLM reasoning input. Decoupling them means Rex can evolve his service schema without breaking the agent's tool output contract. The fields happen to overlap now — that convergence is expected to diverge as the project grows.
+
+**Raised by:** Nova (Commit 11)
+
+---
+
+### D-35 · All conditional routing is deterministic code — zero LLM calls in edge functions
+
+**What:** The four `_route_after_*` functions in `graph.py` read state fields directly (`state["availability"].available`, `len(state["substitutes"]) > 0`, etc.) and return node name strings. No LLM call is made in any routing function.
+
+**Why:** Routing based on LLM output (e.g., asking the model "should we go to present_options or find_substitutes?") would introduce non-determinism, latency, and cost for decisions that are fully expressible as code. `availability.available` is a boolean — branching on it is a one-line `if` statement. Reserving LLM calls for tasks that genuinely require language understanding (parsing requests, formatting responses) and handling everything else with deterministic code is a core principle of reliable agent design.
+
+**Raised by:** Nova (Commit 11)
+
+---
+
+### D-36 · Tools called directly in graph nodes — not via LangChain `ToolNode`
+
+**What:** Each graph node that calls a tool does so explicitly via `await tool.ainvoke({"arg": value})`. The LangChain `ToolNode` utility (which auto-routes tool calls from LLM messages) is not used.
+
+**Why:** `ToolNode` executes whatever tool the LLM chose in its last message. In this graph, the search-then-check-then-substitute sequence has a specific order that must be enforced regardless of what the LLM requests. Using `ToolNode` would allow the LLM to call tools out of sequence or skip the availability check entirely. Explicit node-level tool calls give us deterministic sequencing, typed results, and clear error boundaries per node.
+
+**Raised by:** Nova (Commit 11)
+
+---
+
+### D-37 · `apologise_node` has a hardcoded fallback — LLM failure returns canned message
+
+**What:** If the LLM call inside `apologise_node` itself raises an exception, the node catches it and returns a hardcoded `AIMessage` ("I'm sorry, I'm having trouble right now...") rather than re-raising or setting `state["error"]`.
+
+**Why:** `apologise_node` is the terminal error handler for the whole graph. If it re-raised, the graph would propagate an uncaught exception to the route handler, which would return a 500 to the customer. A hardcoded fallback guarantees the customer always receives a response — even when both the LLM and the circuit breaker have failed. The fallback is intentionally generic so it does not mislead the customer about what went wrong.
+
+**Raised by:** Nova (Commit 11)
+
+---
+
 ### D-03 · Named Docker volumes for Postgres and Redis persistence
 
 **What:** Data volumes are declared as named volumes (`postgres_data`, `redis_data`) rather than bind mounts to a local `data/` directory.
