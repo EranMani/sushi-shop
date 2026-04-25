@@ -1,6 +1,9 @@
 # Sushi Shop
 
 [![CI](https://github.com/EranMani/sushi-shop/actions/workflows/ci.yml/badge.svg)](https://github.com/EranMani/sushi-shop/actions/workflows/ci.yml)
+![Status](https://img.shields.io/badge/status-work%20in%20progress-yellow)
+
+> **Work in progress.** The backend is functional but the project is still being actively built. Expect incomplete test coverage and missing features.
 
 An AI-powered sushi restaurant simulation. Customers describe what they want in natural language — a LangGraph agent finds matching meals, checks ingredient availability, offers substitutes if needed, and dispatches the confirmed order to the kitchen. Celery workers then drive the order through a real state machine (`PENDING → PREPARING → READY`).
 
